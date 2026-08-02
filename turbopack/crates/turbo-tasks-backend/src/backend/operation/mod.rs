@@ -162,15 +162,6 @@ pub trait ExecuteContext<'e>: Sized {
     /// Takes the ids recorded by [`Self::note_gc_edge_loss_candidate`] since the last call. Empty
     /// outside a GC context.
     fn take_gc_edge_loss_candidates(&mut self) -> Vec<TaskId>;
-    /// In the GC context only, whether `task_id` is currently resident: `Some(false)` means opening
-    /// it via [`Self::task`] would restore it from disk. Under the GC phase that must never happen
-    /// — a collected task stays resident (soft-deleted) precisely so a forward-dep scrub or cascade
-    /// finds a live entry rather than resurrecting a zombie — so GC-only callers `debug_assert`
-    /// against it. `None` for every normal context, which disables the assertion there.
-    fn gc_target_resident(&self, task_id: TaskId) -> Option<bool> {
-        let _ = task_id;
-        None
-    }
     fn should_track_dependencies(&self) -> bool;
     fn should_track_activeness(&self) -> bool;
     fn turbo_tasks(&self) -> Arc<dyn TurboTasksCallApi>;
@@ -1239,13 +1230,6 @@ impl<'e> ExecuteContext<'e> for ExecuteContextImpl<'e> {
             .as_mut()
             .map(std::mem::take)
             .unwrap_or_default()
-    }
-
-    fn gc_target_resident(&self, task_id: TaskId) -> Option<bool> {
-        // Only the GC context (the one collecting zeroed ids) reports residency.
-        self.gc_zeroed
-            .is_some()
-            .then(|| self.backend.storage.with_task(task_id, |_| ()).is_some())
     }
 
     fn note_gc_edge_loss_candidate(&mut self, task_id: TaskId) {

@@ -43,6 +43,8 @@ import type {
 } from './types'
 import { runLoaderWorkerPool } from './loaderWorkerPool'
 
+import { TurbopackEntrypointsError } from './errors'
+
 type RawBindings = typeof import('./generated-native')
 type RawWasmBindings = typeof import('./generated-wasm') & {
   default?(): Promise<typeof import('./generated-wasm')>
@@ -749,18 +751,26 @@ function bindingToApi(
               entrypoints as TurbopackResult<NapiEntrypoints>
             )
           } else {
-            yield {
-              issues: entrypoints.issues,
-            } as TurbopackResult<{}>
+            yield new TurbopackEntrypointsError(entrypoints.issues)
           }
         }
       })()
     }
 
-    serverHmrEvents(): AsyncIterableIterator<TurbopackResult<NodeJsHmrUpdate>> {
-      return subscribe(true, async (callback) =>
-        binding.projectServerHmrEvents(this._nativeProject, callback)
-      )
+    async entrypoints(): Promise<TurbopackResult<RawEntrypoints>> {
+      const entrypoints = (await binding.projectEntrypointsWithIssues(
+        this._nativeProject
+      )) as TurbopackResult<NapiEntrypoints | {}>
+      if (!('routes' in entrypoints)) {
+        throw new TurbopackEntrypointsError(entrypoints.issues)
+      }
+      return napiEntrypointsToRawEntrypoints(entrypoints)
+    }
+
+    async getServerHmrUpdate(): Promise<TurbopackResult<NodeJsHmrUpdate>> {
+      return binding.projectGetServerHmrUpdate(this._nativeProject) as Promise<
+        TurbopackResult<NodeJsHmrUpdate>
+      >
     }
 
     clientHmrEvents(
@@ -1872,3 +1882,5 @@ export async function warnForEdgeRuntime(
 ): Promise<NapiSourceDiagnostic[]> {
   return getBindingsSync().rspack.warnForEdgeRuntime(source, isProduction)
 }
+
+export { TurbopackEntrypointsError }

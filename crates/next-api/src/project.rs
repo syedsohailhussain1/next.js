@@ -2534,8 +2534,8 @@ impl Project {
         }
     }
 
-    /// Aggregate counterpart to [`Self::hmr_version_state`]: one [`VersionState`]
-    /// covering every server HMR-eligible chunk. See [`Self::server_hmr_update`].
+    /// One [`VersionState`] covering every server HMR-eligible chunk. See
+    /// [`Self::server_hmr_update`].
     #[turbo_tasks::function(session_dependent)]
     pub async fn server_hmr_version_state(self: ResolvedVc<Self>) -> Result<Vc<VersionState>> {
         #[tracing::instrument(level = "info", name = "get server HMR version", skip_all)]
@@ -2551,7 +2551,7 @@ impl Project {
         }
         let version_op = server_hmr_version_operation(self);
 
-        // INVALIDATION: untracked initial read; the subscription drives invalidation.
+        // INVALIDATION: untracked initial read; each pull computes from this state.
         let state = VersionState::new(
             version_op
                 .read_trait_strongly_consistent()
@@ -2562,8 +2562,8 @@ impl Project {
         Ok(state)
     }
 
-    /// Aggregate counterpart to [`Self::hmr_update`]: a single `Update` whose
-    /// combined `ChunkListUpdate` is the union of the server entry chunk diffs.
+    /// A single `Update` whose combined `ChunkListUpdate` is the union of the
+    /// server entry chunk diffs.
     ///
     /// Each tracked entry chunk's own update is a `ChunkListUpdate` (carrying
     /// the module deltas for its shared chunks via the merger) or a bare
@@ -2601,7 +2601,7 @@ impl Project {
         // Nothing to apply, but `from` still needs to advance to `to`. Reaching
         // here means `from` held a version we couldn't diff against (it wasn't an
         // `AggregateHmrVersion`), so `diff_chunks_against` gave up and returned
-        // nothing. An empty `Partial` moves the subscription's state forward so
+        // nothing. An empty `Partial` moves the session state forward so
         // the *next* change produces a real diff; returning `Total` instead would
         // force a needless full re-evaluation.
         if chunk_updates.is_empty() && !has_new_chunks {

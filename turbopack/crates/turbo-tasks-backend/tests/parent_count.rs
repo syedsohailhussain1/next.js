@@ -164,8 +164,8 @@ async fn parent_count_tracks_connect_and_disconnect() {
         );
         // leaf(10) is still listed as a child by the (now-garbage) branch_a — nothing re-executed
         // branch_a to drop that edge — so its parent_count stays 1. It only drops to 0 once
-        // branch_a is torn down (the eager-teardown cascade, wired in a later stage). The
-        // count accurately reflects the live `children` edges at all times.
+        // branch_a is torn down by the GC cascade. The count accurately reflects the live
+        // `children` edges at all times.
         assert_eq!(
             tt2.backend().parent_count_for_testing(leaf10_id),
             1,
@@ -608,12 +608,10 @@ async fn build_and_disconnect_wide(tt: Arc<TurboTasks<TurboTasksBackend>>) {
 }
 
 /// A whole wide **aggregating** subtree, disconnected cleanly, must be reclaimed in a *single* GC
-/// pass — the aggregation-graph rebalance frees the leaves' `upper` edges so nothing is stranded
-/// with a dangling aggregation edge to the collected parent. This is the end-to-end invariant the
-/// GC discovery buffers (count-zeroed + edge-loss) exist to uphold: `wide_parent` is promoted to an
-/// aggregating node over `WIDE_FANOUT` leaves, so collecting it must both drop every leaf's
-/// `parent_count` and rebalance away every leaf's `upper` edge in the same pass. Assert the exact
-/// subtree size is collected and that memory drops by precisely that many resident tasks.
+/// pass. `wide_parent` is promoted to an aggregating node over `WIDE_FANOUT` leaves, so collecting
+/// it must both drop every leaf's `parent_count` and rebalance away every leaf's `upper` edge in
+/// the same pass — the end-to-end invariant the GC discovery buffers (count-zeroed + edge-loss)
+/// exist to uphold.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gc_collects_wide_aggregating_subtree_in_one_pass() {
     let dir = create_test_persistence_dir("gc_collects_wide_aggregating_subtree_in_one_pass");
@@ -647,15 +645,11 @@ async fn gc_collects_wide_aggregating_subtree_in_one_pass() {
 /// Erase-while-referenced invariant: a task must never be hard-`erase`d from storage while a live
 /// task still holds an incoming aggregation edge (`upper`/`follower`) to it. `evict_after_snapshot`
 /// erases any soft-`deleted` task unconditionally, trusting that by erase time every edge into it
-/// has been scrubbed. If a sibling collect cascade added an `upper`/`follower` onto a task on its
-/// way out, that trust would break and leave a live task pointing into freed storage.
+/// has been scrubbed; a sibling collect cascade adding an `upper`/`follower` onto a task on its way
+/// out would break that and leave a live task pointing into freed storage.
 ///
-/// This builds the wide **aggregating** subtree (`wide_parent` + `WIDE_FANOUT` leaves), disconnects
-/// it, and runs a single drained GC pass followed by snapshot+eviction (which is where erase
-/// happens). The whole graph is resident throughout, so any surviving `upper`/`follower` edge whose
-/// target is no longer resident is necessarily a dangling edge into an erased task — exactly the
-/// bug. Asserting there is none locks the invariant that collection scrubs incoming edges before
-/// erase.
+/// The whole graph is resident throughout, so any surviving `upper`/`follower` edge whose target is
+/// no longer resident is necessarily a dangling edge into an erased task.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gc_never_erases_a_task_that_is_still_referenced() {
     let dir = create_test_persistence_dir("gc_never_erases_a_task_that_is_still_referenced");

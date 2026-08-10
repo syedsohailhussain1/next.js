@@ -560,16 +560,12 @@ impl Storage {
     }
 
     /// Test-only GC invariant check: every incoming aggregation edge (`upper`/`followers`) held by
-    /// a resident task must point at a task that is **still resident**. When the whole graph is
-    /// in memory (as in the GC unit tests, which build everything before running a pass and
-    /// never evict mid-build), "not resident" means "erased" — so a dangling edge here is
-    /// exactly the erase-while-referenced bug: a task was `erase`d while a live task still
-    /// referenced it. Returns `(referrer, dangling_target)` for the first violation, or `None`
-    /// if the graph is clean.
+    /// a resident task must point at a task that is **still resident**. Returns
+    /// `(referrer, dangling_target)` for the first violation, or `None` if the graph is clean.
     ///
-    /// Only meaningful for a fully-resident graph: a legitimately *evicted* (not erased) target
-    /// would also read as "not resident", so callers must not have evicted live tasks before
-    /// calling.
+    /// Only meaningful for a fully-resident graph: "not resident" is read as "erased", which
+    /// identifies the erase-while-referenced bug — but a legitimately *evicted* target reads the
+    /// same way, so callers must not have evicted live tasks before calling.
     pub fn find_dangling_aggregation_edge(&self) -> Option<(TaskId, TaskId)> {
         let mut resident = FxHashSet::default();
         for shard in self.map.shards() {
@@ -608,14 +604,11 @@ impl Storage {
     }
 
     /// Scans a **single** shard by index, invoking `on_candidate` for each resident, non-transient
-    /// task whose storage passes the cheap [`TaskStorage::gc_maybe_collectible`] pre-filter (a
-    /// handful of field reads, the same shape as the eviction scan).
+    /// task whose storage passes the cheap [`TaskStorage::gc_maybe_collectible`] pre-filter.
     ///
     /// GC drives one of these per shard as a job in its main pool, so discovered candidates flow
-    /// straight into the same queue the collect jobs drain — the cascade starts while later shards
-    /// are still being scanned, instead of after a whole-map barrier. `on_candidate` runs while the
-    /// shard **read lock is held**, so it must be cheap and must not re-enter the map; GC only
-    /// enqueues the id.
+    /// straight into the same queue the collect jobs drain. `on_candidate` runs while the shard
+    /// **read lock is held**, so it must be cheap and must not re-enter the map.
     ///
     /// The scan only sees resident tasks; disk-only garbage is collected after it is next restored.
     ///

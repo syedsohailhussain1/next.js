@@ -67,25 +67,17 @@ pub fn connect_children(
         //    their edges by re-executing on restart). Transient children are never collected, so
         //    they take no count.
         //
-        //    CRITICAL: this is a **direct** adjustment, NOT a queued `AdjustParentCount` job, and
-        // it    MUST run before `queue.execute` below (the first `operation_suspend_point`
-        // this    function reaches). GC reads `parent_count` to decide collectibility and
-        // only observes    state at suspend points (`begin_gc` drains operations to a
-        // suspended/quiescent state).    If the `+1` rode the `AggregationUpdateQueue`
-        // instead, that queue's per-iteration    suspend point could suspend with the `+1`
-        // still pending — leaving a window where the    `children` edge is committed
-        // (`extend_children` in the caller) but `parent_count` is    not yet incremented. A
-        // GC pass landing in that window would read the under-counted    `parent_count ==
-        // 0`, judge the (genuinely reachable) child collectible, and delete it.    There is
-        // no `operation_suspend_point` between the caller's `extend_children` and here
-        //    (`make_task_dirty_internal` only enqueues; the queue runs later), so no snapshot/GC
-        // can    observe the edge without the count. In the parallelized path this runs on
-        // a child    context (which never suspends — it holds no operation guard), inside
-        // the    `scope_and_block` barrier that completes within the parent operation, so
-        // the property    holds there too. (The `-1` on edge removal in `CleanupOldEdges`
-        // has the opposite,    benign failure mode — a pending `-1` makes GC
-        // *under*-collect for one pass,    self-correcting — so it stays on the durable
-        // queue there.)
+        //    CRITICAL: the `+1` is applied **directly**, not via a queued `AdjustParentCount` job,
+        //    and MUST land before `queue.execute` below (the first `operation_suspend_point` this
+        //    function reaches). GC only observes state at suspend points, so a `+1` riding the
+        //    queue could suspend while still pending — leaving a window where the `children` edge
+        //    is committed (`extend_children` in the caller) but `parent_count` is not yet
+        //    incremented. A GC pass landing there would read `parent_count == 0`, judge the
+        //    genuinely-reachable child collectible, and delete it. In the parallelized path this
+        //    runs on a child context, which never suspends, inside a `scope_and_block` barrier
+        //    that completes within the parent operation. (The `-1` in `CleanupOldEdges` has the
+        //    opposite, benign failure mode — a pending `-1` under-collects for one pass — so it
+        //    stays on the durable queue there.)
         //
         // 2. Make any child that has not produced output yet dirty, so it gets scheduled and
         //    computes. Runs only on the successful connect (not the stale/cancel early-returns in

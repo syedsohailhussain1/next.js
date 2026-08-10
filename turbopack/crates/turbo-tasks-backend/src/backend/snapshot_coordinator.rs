@@ -13,10 +13,9 @@
 //!   work, then wakes everyone.
 //!
 //! Snapshots and GC use two distinct request bits ([`SNAPSHOT_REQUESTED_BIT`] and
-//! [`GC_REQUESTED_BIT`]) so they can be reasoned about independently — a snapshot's exclusion is
-//! never interrupted, whereas a GC pass may abort mid-mark. Operations drain/suspend for either
-//! bit. Snapshots and GC are themselves mutually exclusive; callers serialize them with the
-//! `snapshot_in_progress` mutex in `mod.rs` (the coordinator does not own that mutex).
+//! [`GC_REQUESTED_BIT`]); operations drain/suspend for either. Snapshots and GC are mutually
+//! exclusive, and callers serialize them with the `snapshot_in_progress` mutex in `mod.rs` — the
+//! coordinator does not own that mutex, because callers interleave work between phases.
 
 use std::sync::{
     Arc,
@@ -68,7 +67,7 @@ pub struct SnapshotCoordinator<O = AnyOperation> {
     in_progress_operations: AtomicUsize,
     state: Mutex<State<O>>,
     /// Notified by the last operation to drain (count drops to zero while a request bit is set).
-    /// Awaited by [`begin_snapshot`] and [`begin_gc`].
+    /// Awaited by [`SnapshotCoordinator::begin_snapshot`] and [`SnapshotCoordinator::begin_gc`].
     operations_drained: Condvar,
     /// Notified by [`SnapshotPhase::drop`] and [`GcPhase::drop`]. Awaited by operations that hit a
     /// suspend point or arrive while a snapshot or GC pass is in flight. Operations wait while
@@ -164,14 +163,12 @@ impl<O> SnapshotCoordinator<O> {
                 // acquiring the mutex. Nothing to do.
                 return;
             }
-            // Record the suspended operation in the uncompleted-operations set unconditionally,
-            // even when only a GC pass is in flight. A GC pass may hand its exclusion straight to a
-            // snapshot (`GcPhase::into_snapshot`) without this operation resuming first; that
-            // snapshot persists the operation's partial in-memory mutations, so it MUST also record
-            // the operation for replay — otherwise a crash leaves the persisted graph inconsistent.
-            // A standalone GC pass (ended via `GcPhase::Drop`, no snapshot) never persists, so the
-            // recorded entry is simply never read; the cost of running `suspend()` there is
-            // acceptable for the correctness guarantee.
+            // Record the suspended operation unconditionally, even when only a GC pass is in
+            // flight: a GC pass may hand its exclusion straight to a snapshot
+            // (`GcPhase::into_snapshot`) without this operation resuming first, and that snapshot
+            // persists the operation's partial in-memory mutations — so it MUST also record the
+            // operation for replay, or a crash leaves the persisted graph inconsistent. For a
+            // standalone GC pass the recorded entry is simply never read.
             let op = Arc::new(suspend());
             state
                 .suspended_operations
@@ -203,12 +200,9 @@ impl<O> SnapshotCoordinator<O> {
     /// blocks until every in-flight operation has drained or suspended. Returns the still-held
     /// state lock so the caller can read `suspended_operations` (snapshot) before releasing it.
     ///
-    /// `what` ("snapshot" / "gc") only labels the assertion messages and the drain span. Snapshot
-    /// and GC are mutually exclusive; production callers serialize them via the
-    /// `snapshot_in_progress` mutex in `mod.rs` (the coordinator doesn't own that mutex —
-    /// callers interleave work between phases). The mutual-exclusion asserts are promoted from
-    /// debug_assert because silently ignoring a violation leads straight to a stuck counter and
-    /// a hung process.
+    /// `what` only labels the assertion messages and the drain span. The mutual-exclusion asserts
+    /// are `assert!` rather than `debug_assert!` because silently ignoring a violation leads
+    /// straight to a stuck counter and a hung process.
     fn begin_exclusion(
         &self,
         what: Exclusion,
@@ -423,11 +417,10 @@ pub struct GcPhase<'a, O> {
 
 impl<'a, O> GcPhase<'a, O> {
     /// Atomically transitions from the GC phase directly into a snapshot phase **without ever
-    /// releasing operation exclusion**. Under the state lock it clears the GC request bit and sets
-    /// the snapshot request bit in one critical section, so no operation can start in between (an
-    /// operation blocks while *either* bit is set). This closes the race where a mutation could
-    /// resurrect a just-collected task in the gap between the GC pass and the snapshot: with an
-    /// atomic hand-off there is no such gap, so the GC cascade's `parent_count` decrements and the
+    /// releasing operation exclusion**: under the state lock it clears the GC request bit and sets
+    /// the snapshot request bit in one critical section, and an operation blocks while either bit
+    /// is set. This closes the race where a mutation in the gap between the pass and the snapshot
+    /// could resurrect a just-collected task, so the GC cascade's `parent_count` decrements and the
     /// snapshot see a consistent graph. `begin_gc` already drained operations to zero, so no
     /// further draining is needed.
     pub fn into_snapshot(self) -> SnapshotPhase<'a, O> {

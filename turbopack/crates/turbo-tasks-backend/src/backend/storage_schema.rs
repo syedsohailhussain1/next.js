@@ -149,14 +149,12 @@ struct TaskStorageSchema {
     /// task, and it is not a root/pinned/in-progress), the task is unreachable from persistent
     /// roots and may be tombstoned instead of persisted, then dropped from memory during eviction.
     ///
-    /// This replaces scan-based GC: a count can only drop to 0 while the parent is in memory (a
-    /// parent re-executed and dropped the child), so collectibility is detectable at that moment
-    /// with no DB scan.
+    /// A count can only drop to 0 while the parent is in memory (a parent re-executed and dropped
+    /// the child), so collectibility is detectable at that moment with no DB scan.
     // Stored inline (not lazy): `parent_count` is near-universal and mutated on every child-edge
-    // change, so a lazy-Vec scan per access is wasteful. `AutoSet`/`AutoMap` are backed by
-    // `InlineVec` whose size shrinks with the inline-capacity const, which brought `TaskStorage`
-    // down far enough to afford two inline `u32` counts within the size budget (see
-    // `test_schema_size`). `default` gives absent==0 semantics with a bare `u32` (no `Option`).
+    // change, so a lazy-Vec scan per access is wasteful. The inline `u32` counts fit within the
+    // size budget asserted by `test_schema_size`. `default` gives absent==0 semantics with a bare
+    // `u32` (no `Option`).
     #[field(storage = "direct", category = "meta", inline, default)]
     parent_count: u32,
 
@@ -253,13 +251,13 @@ struct TaskStorageSchema {
     /// GC soft-deletion marker. Set by the garbage collector when a task is collected: its edges
     /// have been scrubbed and it is destined for deletion, but it stays **resident** (this is a
     /// transient flag, so eviction's `drop_partial` keeps it as residue) until the next snapshot
-    /// tombstones its on-disk copy and a later step hard-deletes it. Keeping it resident closes
-    /// the resurrection window — any `ctx.task` on it during the pass finds a real entry
-    /// rather than restoring a zombie from disk. Cleared (and the task marked dirty) if the
-    /// task is resurrected by a connect before the hard-delete. Never persisted (a crash just
-    /// leaves the task on disk to be re-collected next session). Because it is transient, setting
-    /// it does not implicitly track a modification, so the GC mark explicitly calls
-    /// `track_modification(Meta)` to force the task into the next snapshot's scan.
+    /// tombstones its on-disk copy and a later step hard-deletes it. Staying resident closes the
+    /// resurrection window — any `ctx.task` on it during the pass finds a real entry rather than
+    /// restoring a zombie from disk. Cleared (and the task marked dirty) if a connect resurrects
+    /// it before the hard-delete. Never persisted: a crash just leaves the task on disk to be
+    /// re-collected next session. Because it is transient, setting it does not implicitly track a
+    /// modification, so the GC mark explicitly calls `track_modification(Meta)` to force the task
+    /// into the next snapshot's scan.
     #[field(storage = "flag", category = "transient")]
     deleted: bool,
 
@@ -610,15 +608,13 @@ impl TaskStorage {
             Some(_) => KeyEvictability::Evictable,
         };
         // A task with a live transient reference (a `prevent_gc` pin, a detached handle, or a
-        // transient parent — see `transient_ref_count`) is NOT forced fully resident. It falls
-        // through to the normal Meta/Data evictability below: `drop_partial` retains non-default
+        // transient parent — see `transient_ref_count`) is NOT forced fully resident; it falls
+        // through to the normal Meta/Data evictability below. `drop_partial` retains non-default
         // *transient* fields, so `transient_ref_count` survives as residue and the map entry is
-        // kept (see `DropPartialOutcome::HasResidue`), while the Meta/Data it no longer
-        // needs are reclaimed. Losing the count to eviction (which would expose the
-        // still-referenced task to collection) can't happen. After such a partial eviction
-        // the task's Meta is gone, so it is not immediately GC-collectible even once
-        // unpinned — `is_gc_collectible` requires Meta resident — which is safe
-        // (under-collection; a later access restores Meta and a later pass collects it).
+        // kept (see `DropPartialOutcome::HasResidue`) — the count can never be lost to eviction and
+        // expose a still-referenced task to collection. Such a task also has no resident Meta
+        // afterwards, so it is not immediately collectible even once unpinned, which is safe:
+        // a later access restores Meta and a later pass collects it.
         //
         // All these flags imply that the task is currently being used in some way
         // either literally executing, or about to
@@ -902,19 +898,18 @@ impl TaskStorage {
     /// The storage-only part of GC collectibility: `Meta` is resident, no persistent or transient
     /// parents, quiescent (not active, not in progress), and no aggregation edges
     /// (`upper`/`followers`). Does NOT include the transient-*id* check (a `TaskStorage` has no id)
-    /// — the caller must also confirm `!task_id.is_transient()`. [`TaskGuard::is_gc_collectible`]
+    /// — the caller must also confirm `!task_id.is_transient()`.
+    /// [`TaskGuard::is_gc_collectible`](crate::backend::operation::TaskGuard::is_gc_collectible)
     /// is the authoritative predicate; it adds the id check and delegates here. GC uses this
     /// bare form to cheaply pre-filter the resident map (see `gc_collect`) without opening a
     /// guard per task.
     ///
     /// **The `is_restored(Meta)` gate is load-bearing.** `parent_count` and the aggregation-edge
     /// fields are Meta-category, so a task whose `Meta` has been evicted (`drop_partial`) reads
-    /// them as their defaults — `parent_count == 0`, empty `upper`/`followers` — which would
-    /// look collectible even though the task's *persisted* Meta may say otherwise (a nonzero
-    /// parent count, live edges). This raw predicate has no guard to restore Meta from disk, so
-    /// it must refuse to judge an unrestored task and leave it for a pass after it is next
-    /// restored. (`is_gc_collectible` reaches here through a restoring `ctx.task(.., All)`
-    /// guard, so the gate is trivially satisfied on that path.)
+    /// them as their defaults — `parent_count == 0`, empty `upper`/`followers` — and would look
+    /// collectible even though its *persisted* Meta says otherwise. This raw predicate has no
+    /// guard to restore Meta from disk, so it must refuse to judge an unrestored task and leave it
+    /// for a pass after it is next restored.
     ///
     /// The aggregation-edges check is conservative: a disconnected task is typically removed from
     /// the aggregation graph, but that can lag and race GC, so we back off rather than collect.
@@ -932,17 +927,11 @@ impl TaskStorage {
             && self.followers().is_none_or(|f| f.is_empty())
     }
 
-    // GC collectibility (`is_gc_collectible`) lives on the `TaskGuard` trait, so that the Meta
-    // fields it reads (`parent_count`/`upper`/`followers`) go through the guard's `check_access`
-    // machinery, which enforces that the task was opened with Meta restored. See
-    // `TaskGuard::is_gc_collectible`.
-
     /// Test-only: the first incoming aggregation-edge target (`upper` or `follower`) of this task
-    /// for which `is_gone(target)` reports true. When the whole graph is resident, `is_gone` = "not
-    /// resident" identifies an *erased* target, so a hit here is the erase-while-referenced bug — a
-    /// task was hard-deleted while this live task still pointed at it. Transient targets are
-    /// skipped (never persisted, never GC-collected). Returns `None` if every edge target is
-    /// still present.
+    /// for which `is_gone(target)` reports true, or `None` if every target is still present.
+    /// Transient targets are skipped — never persisted, never GC-collected. See
+    /// [`Storage::find_dangling_aggregation_edge`](crate::backend::storage::Storage::find_dangling_aggregation_edge)
+    /// for how the caller supplies `is_gone`.
     #[doc(hidden)]
     pub fn first_dangling_aggregation_edge(
         &self,

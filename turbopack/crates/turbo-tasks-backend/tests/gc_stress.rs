@@ -209,11 +209,11 @@ async fn huge_root(generation: ResolvedVc<Generation>) -> Result<Vc<u32>> {
     Ok(Vc::cell(sum))
 }
 
-/// Exercises the *per-task* fan-out of the parallel collector (the chunked `Decrement`/`Scrub*`
-/// jobs): a single collected task has thousands of children and forward dependencies, which must be
-/// torn down across worker threads in bounded chunks rather than by one serial job. Collecting the
-/// disconnected generation's `huge_root` (≈FANOUT children) + its FANOUT leaves must fully reclaim
-/// the subtree, and the graph must still recompute afterwards.
+/// Exercises the *per-task* fan-out of the parallel collector: a single collected task has
+/// thousands of children and forward dependencies, all torn down in one `Collect` job while
+/// sibling collects run on other workers. Collecting the disconnected generation's `huge_root`
+/// (≈FANOUT children) + its FANOUT leaves must fully reclaim the subtree, and the graph must still
+/// recompute afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gc_collects_wide_fanout_task() {
     let (tt, _persistence_dir) = create_tt("gc_collects_wide_fanout_task");

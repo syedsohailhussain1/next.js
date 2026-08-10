@@ -8,9 +8,7 @@
 //! The central invariant: when a task `S` that is the `upper` of its children is collected, GC
 //! must **rebalance the aggregation graph** — remove `S` from each child's `upper` set — so the
 //! children (now both parentless and upper-less) become collectible and cascade in the same pass.
-//! GC does this by running the same `CleanupOldEdges` operation a re-executing task uses. Without
-//! it, a collected `S`'s children were left with a dangling `upper` edge to the deleted `S` and
-//! stayed stuck non-collectible (leaked until eviction).
+//! GC does this by running the same `CleanupOldEdges` operation a re-executing task uses.
 //!
 //! For a child to record a forward-dependency edge on / from `S` at all, the tasks involved must
 //! be **mutable** (immutable/constant tasks never record dependency edges — see
@@ -129,9 +127,8 @@ async fn diamond_reader(target: ResolvedVc<u32>) -> Result<Vc<u32>> {
 /// The diamond root: for each index, calls `diamond_target(index)` (`B`, so `B` is the root's
 /// child) and `diamond_reader(B)` (`A`, passing `B`'s resolved Vc in, so `A` is the root's child
 /// and forward-deps on `B` but does NOT parent it). Disconnecting the root drops both `A` and `B`
-/// as siblings; collecting the root cascades a `Collect` for every `A` and `B` at once. If a `B` is
-/// collected+removed before the `Collect(A)` whose `CleanupOldEdges` opens it, the immediate-remove
-/// design resurrects `B`.
+/// as siblings; collecting the root cascades a `Collect` for every `A` and `B` at once, so a `B`
+/// can be collected before the `Collect(A)` whose `CleanupOldEdges` opens it.
 #[turbo_tasks::function]
 async fn diamond_root(constant: ResolvedVc<Constant>) -> Result<Vc<u32>> {
     let mut sum = 0u32;
@@ -178,20 +175,15 @@ async fn select_diamond(
     Ok(Vc::cell(value))
 }
 
-/// Regression test for the missing **aggregation-graph rebalance** in GC.
-///
-/// `reader` is the sole `upper` of each `sd_leaf` (it reads them, and they are mutable so the edge
-/// is recorded). When the `reader` subtree is disconnected cleanly and collected, GC must remove
-/// `reader` from each leaf's `upper` set (the `CleanupOldEdges` rebalance) so the leaves — now
-/// parentless *and* upper-less — cascade-collect in the **same pass**. Before the fix, GC dropped
-/// the leaves' `parent_count` but left a dangling `upper` edge to the deleted `reader`, so every
-/// leaf failed `gc_maybe_collectible` (`upper().is_empty()` false) and only `reader` was collected
-/// (`collected == 1`); the leaves leaked until eviction hid them. This asserts the whole subtree
-/// (`reader` + all `FANOUT` leaves) is collected in one pass and leaves memory with nothing
-/// stranded.
+/// The **aggregation-graph rebalance** in GC: `reader` is the sole `upper` of each `sd_leaf` (it
+/// reads them, and they are mutable so the edge is recorded). When the `reader` subtree is
+/// disconnected cleanly and collected, GC must remove `reader` from each leaf's `upper` set so the
+/// leaves — now parentless *and* upper-less — cascade-collect in the same pass. Without the
+/// rebalance a leaf keeps a dangling `upper` edge to the deleted `reader`, fails
+/// `gc_maybe_collectible`, and leaks until eviction hides it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn gc_shared_forward_dep_no_resurrection() {
-    let (tt, _persistence_dir) = create_tt("gc_shared_forward_dep_no_resurrection");
+async fn gc_rebalances_aggregation_and_cascades_in_one_pass() {
+    let (tt, _persistence_dir) = create_tt("gc_rebalances_aggregation_and_cascades_in_one_pass");
     let tt2 = tt.clone();
 
     // Build the graph (selector=false: select_reader -> reader -> FANOUT sd_leaves), then flip to
@@ -229,8 +221,7 @@ async fn gc_shared_forward_dep_no_resurrection() {
     assert_eq!(
         collected,
         FANOUT as usize + 1,
-        "reader and all {FANOUT} sd_leaves should be collected in one pass (missing aggregation \
-         rebalance would strand the leaves with a dangling upper edge and collect only reader)"
+        "reader and all {FANOUT} sd_leaves should be collected in one pass"
     );
     // The whole subtree left memory: the resident count dropped by exactly what was collected.
     assert_eq!(
@@ -242,17 +233,14 @@ async fn gc_shared_forward_dep_no_resurrection() {
     tt.stop_and_wait().await;
 }
 
-/// The **residual resurrection** race (the one soft-deletion is for). In the diamond, every
+/// The **residual resurrection** race that soft-deletion exists to close. In the diamond, every
 /// `diamond_reader` `A` and its `diamond_target` `B` are direct children of `diamond_root`, and `A`
 /// holds a forward dependency on `B`. Collecting the root cascades a `Collect` for every `A` and
 /// `B` concurrently. When `A`'s teardown runs `CleanupOldEdges(A)`, its dependency arm opens `B`
-/// via `ctx.task(B, Data)` to scrub the reverse edge — and if `B`'s own `Collect` already removed
-/// `B` from the map, `ctx.task` restores it from disk into a zombie (memory/disk diverge).
-///
-/// Under the current immediate-remove `Collect`, this resurrects `B`s and leaves the resident count
-/// above baseline−collected. After soft-deletion (a collected task stays resident until after the
-/// tombstoning snapshot commits) `ctx.task` always finds a resident entry and the count returns to
-/// exactly baseline−collected.
+/// via `ctx.task(B, Data)` to scrub the reverse edge — so if `B` had already been removed from the
+/// map, `ctx.task` would restore it from disk into a zombie and memory/disk would diverge. Because
+/// a collected task stays resident until the tombstoning snapshot commits, `ctx.task` always finds
+/// a resident entry and the resident count drops to exactly baseline−collected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn gc_diamond_forward_dep_no_resurrection() {
     let (tt, _persistence_dir) = create_tt("gc_diamond_forward_dep_no_resurrection");

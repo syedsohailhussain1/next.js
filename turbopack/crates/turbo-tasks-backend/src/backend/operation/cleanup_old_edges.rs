@@ -107,10 +107,10 @@ impl CleanupOldEdgesOperation {
                                     }
                                 }
                                 // Each removed persistent child loses a parent. The queued job
-                                // drops the right counter (durable
-                                // `parent_count` for a persistent parent,
-                                // session-only `transient_ref_count` for a transient one) and takes
-                                // the child guards, avoiding a second guard while `task` is held.
+                                // drops the right counter (durable `parent_count` for a persistent
+                                // parent, session-only `transient_ref_count` for a transient one)
+                                // and takes the child guards, avoiding a second guard while `task`
+                                // is held.
                                 if !removed_persistent_children.is_empty() {
                                     let job = if task_id.is_transient() {
                                         AggregationUpdateJob::AdjustTransientRefCount {
@@ -200,9 +200,9 @@ impl CleanupOldEdgesOperation {
                                     cell,
                                 } = forward;
                                 // Under GC the scrub target must already be resident
-                                // (soft-deleted); a non-resident
-                                // target would resurrect an already-collected task
-                                // from disk. `gc_target_resident` is `None` outside GC.
+                                // (soft-deleted); a non-resident target would resurrect an
+                                // already-collected task from disk. `gc_target_resident` is `None`
+                                // outside GC, which disables the check.
                                 debug_assert!(
                                     ctx.gc_target_resident(cell_task_id) != Some(false),
                                     "gc: CleanupOldEdges({task_id}) cell-dep target \

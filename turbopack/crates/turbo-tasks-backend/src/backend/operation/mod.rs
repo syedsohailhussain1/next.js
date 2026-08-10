@@ -166,9 +166,8 @@ pub trait ExecuteContext<'e>: Sized {
     /// In the GC context only, whether `task_id` is currently resident: `Some(false)` means opening
     /// it via [`Self::task`] would restore it from disk. Under the GC phase that must never happen
     /// — a collected task stays resident (soft-deleted) precisely so a forward-dep scrub or cascade
-    /// finds a live entry rather than resurrecting a zombie — so a `Some(false)` is a bug and the
-    /// GC-only callers `debug_assert` against it. `None` for every normal context (where restoring
-    /// a missing task from disk is legitimate), which disables the assertion there.
+    /// finds a live entry rather than resurrecting a zombie — so GC-only callers `debug_assert`
+    /// against it. `None` for every normal context, which disables the assertion there.
     fn gc_target_resident(&self, task_id: TaskId) -> Option<bool> {
         let _ = task_id;
         None
@@ -249,10 +248,9 @@ pub struct ExecuteContextImpl<'e> {
     turbo_tasks: &'e TurboTasks<TurboTasksBackend>,
     _operation_guard: Option<OperationGuard<'e, AnyOperation>>,
     task_lock_counter: TaskLockCounter,
-    /// GC-only: ids whose persistent `parent_count` reached 0 during this context's operations
-    /// (recorded by `note_gc_parent_count_zeroed`). `None` for normal operation contexts (the
-    /// recording hook is a no-op there); `Some` only for the GC context, drained by the collector
-    /// via [`Self::take_gc_parent_count_zeroed`] to discover cascade-collectible tasks.
+    /// GC-only: ids whose persistent `parent_count` reached 0 during this context's operations.
+    /// `None` for normal contexts, which makes the recording hook a no-op. See
+    /// [`ExecuteContext::note_gc_parent_count_zeroed`].
     // TODO: consider replacing this buffer with a callback so a newly-parentless child is handed
     // to the collector (and can be spawned) immediately, rather than accumulated and drained
     // after the whole `CleanupOldEdges` run finishes. Deferred: spawning mid-cleanup would
@@ -260,11 +258,8 @@ pub struct ExecuteContextImpl<'e> {
     // look at guard/lock ordering before it's worth the reduced latency.
     gc_zeroed: Option<Vec<TaskId>>,
     /// GC-only: ids whose last aggregation edge (`upper` or `followers`) was removed during this
-    /// context's operations (recorded by `note_gc_edge_loss_candidate`). Distinct from
-    /// `gc_zeroed`: these tasks did not lose a persistent parent, so they are never new roots
-    /// — they may just have *newly* satisfied the aggregation-emptiness clauses of
-    /// `is_gc_collectible`. `None` for normal contexts; `Some` only for the GC context,
-    /// drained via [`Self::take_gc_edge_loss_candidates`].
+    /// context's operations. `None` for normal contexts. See
+    /// [`ExecuteContext::note_gc_edge_loss_candidate`].
     gc_edge_loss: Option<Vec<TaskId>>,
 }
 
@@ -314,11 +309,9 @@ impl<'e> ExecuteContextImpl<'e> {
     /// With [`TaskAccess::MaybeCreate`] a missing task is created — `access_mut` inserts a blank
     /// entry and, if disk has nothing, it stays empty. With [`TaskAccess::MustExist`] a task that
     /// exists in **neither memory nor disk** is a bug (a stale reference to an
-    /// already-collected/never-created task); rather than fabricate and return a blank (which would
-    /// silently corrupt the graph) this **panics in debug builds** (the check is debug-only for
-    /// now — see `TaskAccess::MustExist`). Existence is judged from residency (a resident entry
-    /// always exists) and the disk-presence flag `restore_task_data` returns for the categories we
-    /// restore.
+    /// already-collected/never-created task); rather than fabricate a blank and silently corrupt
+    /// the graph, this panics in debug builds. Existence is judged from residency and the
+    /// disk-presence flag `restore_task_data` returns for the categories we restore.
     fn open_task(
         &mut self,
         task_id: TaskId,
@@ -448,12 +441,11 @@ impl<'e> ExecuteContextImpl<'e> {
                 }
             }
         }
-        // NOTE: `MustExist` only enforces *existence* (not fabrication). It deliberately does NOT
-        // assert `!deleted()`: GC/aggregation bookkeeping legitimately opens a soft-deleted task
-        // during the resurrection window (e.g. `resurrect_deleted`, `increase_active_count`) before
-        // it is revived. The "a read must not see a GC-deleted task" invariant is asserted only on
-        // the consumer read paths (`try_read_task_output`/`try_read_task_cell`), which is where a
-        // stale read would actually escape.
+        // `MustExist` enforces existence only; it deliberately does NOT assert `!deleted()`, since
+        // GC/aggregation bookkeeping legitimately opens a soft-deleted task during the resurrection
+        // window (`resurrect_deleted`, `increase_active_count`). The "a read must not see a
+        // GC-deleted task" invariant is asserted on the consumer read paths
+        // (`try_read_task_output`/`try_read_task_cell`), where a stale read would actually escape.
         TaskGuardImpl {
             task,
             task_id,
@@ -970,11 +962,9 @@ impl<'e> ExecuteContext<'e> for ExecuteContextImpl<'e> {
     }
 
     fn resident_task(&mut self, task_id: TaskId) -> Option<TaskGuardImpl<'e>> {
-        // Non-inserting lookup: `None` means the task is not resident (do not resurrect a blank
-        // entry). No restore is performed, so the guard must only touch transient fields — see the
-        // trait doc. Acquire the context's lock counter for the returned guard (released on its
-        // Drop), exactly like `task()`.
         let task = self.backend.storage.access_mut_if_resident(task_id)?;
+        // Acquire the context's lock counter for the returned guard (released on its Drop),
+        // exactly like `task()`.
         self.task_lock_counter.acquire();
         Some(TaskGuardImpl {
             task,
@@ -1434,8 +1424,8 @@ pub trait TaskGuard: Debug + TaskStorageAccessors {
     /// persistent parent connects it as a child, -1 when one disconnects it) and return the new
     /// value. A value of 0 means no persistent parent lists this task — a prerequisite for
     /// collection. Panics on underflow/overflow: the count must equal the true number of
-    /// `children`-edge references, so a decrement below 0 (or a wrap past `u32::MAX`) means it has
-    /// drifted from that invariant and must fail loudly rather than corrupt collectibility.
+    /// `children`-edge references, so drifting from that invariant must fail loudly rather than
+    /// corrupt collectibility.
     fn update_and_get_parent_count(&mut self, delta: i32) -> u32 {
         let current = self.get_parent_count().copied().unwrap_or(0);
         let new_value = current
@@ -1464,10 +1454,9 @@ pub trait TaskGuard: Debug + TaskStorageAccessors {
     ///
     /// The storage-only checks live in [`TaskStorage::gc_maybe_collectible`] so GC's resident-map
     /// scan can reuse them without a guard; this authoritative form adds the transient-*id* check
-    /// and enforces Meta-restoration (`check_access`) — the storage fields it reads are lazy
-    /// Meta fields that read as absent (0/empty) when Meta was evicted, so a task with evicted
-    /// Meta must not be judged collectible from stale absence. GC always opens the task with
-    /// `All` before calling this, so the check passes.
+    /// and enforces Meta-restoration (`check_access`) — the fields it reads are lazy Meta fields
+    /// that read as absent (0/empty) when Meta was evicted, so a task with evicted Meta must not be
+    /// judged collectible from stale absence.
     fn is_gc_collectible(&self) -> bool {
         // Transient-ness is a property of the id, not the storage; transient tasks are never
         // collected.

@@ -2,9 +2,8 @@
 //! driven here via the `gc_for_testing` hook).
 //!
 //! Only the collect pass is timed: each iteration's setup builds a fresh backend, materializes a
-//! large graph, and disconnects it (turning it into garbage) — none of which is measured. The
-//! routine then times a single GC pass over that garbage. Throughput is reported in tasks
-//! collected per second, so regressions/improvements in GC scaling are directly visible.
+//! large graph, and disconnects it — none of which is measured. Throughput is reported in tasks
+//! collected per second.
 //!
 //! Gated behind `TURBOPACK_BENCH_GC` (like the other stress benches) because the per-iteration
 //! setup is expensive. Enable with e.g.:
@@ -13,7 +12,7 @@
 //! TURBOPACK_BENCH_GC=1 cargo bench -p turbo-tasks-backend --bench mod -- gc
 //! ```
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
@@ -73,9 +72,9 @@ fn create_generation() -> Vc<Generation> {
     Generation(State::new(0)).cell()
 }
 
-// --- WIDE shape: root -> `width` intermediates, each -> a leaf (2 tasks per index). Bumping the
+// WIDE shape: root -> `width` intermediates, each -> a leaf (2 tasks per index). Bumping the
 // generation disconnects the whole previous generation, so a collect tears down ~2*width tasks and
-// exercises the chunked per-task fan-out plus a one-level cascade (intermediate -> its leaf). ---
+// exercises the per-task fan-out plus a one-level cascade (intermediate -> its leaf).
 
 #[turbo_tasks::function]
 fn wide_leaf(generation: u32, index: u32) -> Vc<u32> {
@@ -133,6 +132,7 @@ pub fn gc(c: &mut Criterion) {
     }
 
     let mut group = c.benchmark_group("turbo_tasks_backend_gc");
+    group.measurement_time(Duration::from_secs(20));
     // Setup dominates wall time and each sample runs a full pass over a large graph; keep the
     // sample count modest.
     group.sample_size(10);
@@ -144,6 +144,7 @@ pub fn gc(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("wide", garbage), &width, |b, &width| {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
+                .worker_threads(4)
                 .build()
                 .unwrap();
             // PerIteration: each collect consumes its garbage, so every iteration needs a freshly
@@ -151,11 +152,9 @@ pub fn gc(c: &mut Criterion) {
             b.iter_batched(
                 || setup_wide_garbage(&rt, width),
                 |(tt, _dir)| {
-                    // `gc_for_testing` is synchronous but internally uses `scope_unbounded`,
-                    // which needs a tokio runtime context (spawns helpers / may `block_in_place`),
-                    // so run it on a runtime worker via `block_on`. The block_on wrapper is a fixed
-                    // few-µs overhead, negligible next to the ms-scale pass and constant across
-                    // samples.
+                    // `gc_for_testing` is synchronous but internally uses `scope_unbounded`, which
+                    // needs a tokio runtime context (spawns helpers / may `block_in_place`), so run
+                    // it on a runtime worker via `block_on`.
                     let collected = rt.block_on(async { tt.backend().gc_for_testing(&tt) });
                     // Return the backend so its (large) teardown happens on criterion's drop path,
                     // not inside the measured routine.

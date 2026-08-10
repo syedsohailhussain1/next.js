@@ -215,8 +215,8 @@ pub struct TurboTasksBackend {
     snapshot_in_progress: Mutex<()>,
 
     /// Whether the `parent_count` GC pass runs for this backend. Initialized from the
-    /// `TURBO_ENGINE_GC` env var and, in debug builds, forced off if the configuration would
-    /// strand soft-deleted tasks resident — see the constructor.
+    /// `TURBO_ENGINE_GC` env var, and forced off if the configuration would strand soft-deleted
+    /// tasks resident — see the constructor.
     gc_enabled: bool,
 
     stopping: AtomicBool,
@@ -257,11 +257,8 @@ impl TurboTasksBackend {
         // GC leaves collected tasks resident (soft-deleted) until a reclaim step removes them. The
         // background `ReadWrite` loop reclaims them in `evict_after_snapshot`, so GC there REQUIRES
         // eviction to be on; with eviction off, soft-deleted tasks would accumulate forever. The
-        // `ReadWriteOnShutdown` drain path drops the whole map wholesale (no per-cycle eviction
-        // needed), and `ReadOnly` never persists/GCs. In debug builds, refuse the unsafe combo by
-        // forcing GC off with a warning; release builds trust the caller's configuration.
-        // Opt-in via `TURBO_ENGINE_GC` until GC has been proven on trusted apps; the eventual
-        // default-on flip gets its own escape hatch.
+        // `ReadWriteOnShutdown` drain path drops the whole map wholesale, and `ReadOnly` never
+        // persists/GCs. Refuse that combination with a warning rather than leaking.
         let mut gc_enabled = std::env::var_os("TURBO_ENGINE_GC")
             .is_some_and(|v| matches!(v.to_str(), Some("1" | "true" | "yes")));
         if gc_enabled
@@ -564,9 +561,8 @@ impl TurboTasksBackend {
         // A GC-soft-deleted task must never be *read*: it was collected (edges scrubbed) and would
         // return stale contents. Every re-entry funnels through `resurrect_deleted` at connect,
         // which clears the flag and re-executes, so reaching a read with it still set means a
-        // resurrection path was missed. (Debug-only; the flag exists only when GC is enabled. This
-        // consumer read is where the invariant belongs — bookkeeping opens legitimately touch a
-        // deleted task mid-resurrection, so `task`/`MustExist` itself does not assert it.)
+        // resurrection path was missed. Asserted here rather than in `task`/`MustExist` because
+        // bookkeeping opens legitimately touch a deleted task mid-resurrection.
         debug_assert!(
             !task.deleted(),
             "read_task_output on a GC-deleted task {task_id} — a resurrection path was missed"
@@ -1070,9 +1066,9 @@ impl TurboTasksBackend {
         // a time. Held for the entire snapshot lifecycle.
         let _snapshot_in_progress = self.snapshot_in_progress.lock();
 
-        // When GC is enabled, run the pass and hand its exclusion straight to the snapshot
-        // (`into_snapshot`, no operation can run in between), so the collected tasks' tombstones
-        // (derived from the `deleted` flag) ride this same commit. Opt-in via `TURBO_ENGINE_GC`.
+        // Run the pass and hand its exclusion straight to the snapshot (`into_snapshot`, no
+        // operation can run in between), so the collected tasks' tombstones (derived from the
+        // `deleted` flag) ride this same commit.
         let mut snapshot_phase = if self.gc_enabled {
             let gc_span = tracing::info_span!(
                 parent: parent_span.clone(),
@@ -1321,11 +1317,9 @@ impl TurboTasksBackend {
             }
 
             // A GC-soft-deleted task that reaches the scan is a *persisted* one being tombstoned:
-            // its on-disk copy (task meta/data + `TaskCache` entry) is deleted in this same commit,
-            // riding the shard iterator `save_snapshot` consumes. (GC forced it into the scan via
-            // `track_modification`; a *never-persisted* collected task had its modified bits
-            // cleared by GC — see `discard_modifications_for_gc_new_task` — so it is
-            // never scanned here.)
+            // its on-disk copy (task meta/data + `TaskCache` entry) is deleted in this same commit.
+            // A never-persisted collected task had its modified bits cleared by GC (see
+            // `discard_modifications_for_gc_new_task`), so it is never scanned here.
             if inner.flags.deleted() {
                 debug_assert!(
                     !inner.flags.new_task(),
@@ -3059,7 +3053,6 @@ impl TurboTasksBackend {
                         // grouped together in trace viewers.
                         let background_span =
                             tracing::info_span!(parent: None, "background snapshot");
-
                         match self.snapshot_and_persist(background_span.id(), reason, turbo_tasks) {
                             Err(err) => {
                                 // save_snapshot consumed persisted_task_cache_log entries;
@@ -3097,7 +3090,6 @@ impl TurboTasksBackend {
                                         }
                                     }};
                                 }
-
                                 // Evict persisted tasks from memory to reclaim space.
                                 // Like compaction, this runs after snapshot_and_persist
                                 // as a separate concern.

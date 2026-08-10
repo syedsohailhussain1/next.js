@@ -1452,19 +1452,16 @@ impl AggregationUpdateQueue {
                     }
                 }
                 AggregationUpdateJob::AdjustParentCount { task_ids, delta } => {
-                    // Apply the persistent parent_count delta to each task. Maintained here (rather
-                    // than inline at the edge sites) so the update rides the durable queue: a
+                    // Apply the persistent parent_count delta to each task. Maintained here rather
+                    // than inline at the edge sites so the update rides the durable queue: a
                     // snapshot captures it mid-flight and it replays to completion on restart,
                     // keeping the count crash-consistent.
                     //
                     // A count reaching 0 means the task lost its last persistent parent and may be
-                    // collectible. Outside GC we don't record it (the collectibility is derived
-                    // from the durable `parent_count` directly). During a GC
-                    // pass, the collector runs this decrement (via
-                    // `CleanupOldEdges` on a collected task) and needs to
-                    // discover the newly-parentless children to cascade into:
-                    // `note_gc_parent_count_zeroed` records them on the GC
-                    // context (a no-op for every normal context).
+                    // collectible. During a GC pass the collector runs this decrement (via
+                    // `CleanupOldEdges` on a collected task) and needs to discover the
+                    // newly-parentless children to cascade into; `note_gc_parent_count_zeroed`
+                    // records them on the GC context and is a no-op for every normal context.
                     ctx.for_each_task_meta(task_ids, "AdjustParentCount", |mut task, ctx| {
                         if task.update_and_get_parent_count(delta) == 0 {
                             let id = task.id();
@@ -1949,8 +1946,8 @@ impl AggregationUpdateQueue {
                 if removed_upper {
                     let data = AggregatedDataUpdate::from_task(&mut follower).invert();
                     let followers = get_followers(&follower);
-                    // `lost_follower_id` just lost an upper edge; if that was its last one it may
-                    // have newly become GC-collectible (clause 7 of `gc_maybe_collectible`).
+                    // If that was its last upper edge, `lost_follower_id` may have newly become
+                    // GC-collectible.
                     if follower.is_upper_empty() {
                         ctx.note_gc_edge_loss_candidate(lost_follower_id);
                     }
@@ -2030,8 +2027,8 @@ impl AggregationUpdateQueue {
                     let has_active_count = ctx.should_track_activeness()
                         && upper.get_activeness().is_some_and(|a| a.active_counter > 0);
                     let upper_ids = get_uppers(&upper);
-                    // `upper_id` just lost a follower edge; if that was its last one it may have
-                    // newly become GC-collectible (clause 8 of `gc_maybe_collectible`).
+                    // If that was its last follower edge, `upper_id` may have newly become
+                    // GC-collectible.
                     if upper.is_followers_empty() {
                         ctx.note_gc_edge_loss_candidate(upper_id);
                     }
@@ -2133,8 +2130,8 @@ impl AggregationUpdateQueue {
             if !removed_uppers.is_empty() {
                 let data = AggregatedDataUpdate::from_task(&mut follower).invert();
                 let followers = get_followers(&follower);
-                // `lost_follower_id` just lost one or more upper edges; if it now has none it may
-                // have newly become GC-collectible (clause 7 of `gc_maybe_collectible`).
+                // If `lost_follower_id` now has no upper edges it may have newly become
+                // GC-collectible.
                 if follower.is_upper_empty() {
                     ctx.note_gc_edge_loss_candidate(lost_follower_id);
                 }
@@ -2218,8 +2215,8 @@ impl AggregationUpdateQueue {
                     let has_active_count = ctx.should_track_activeness()
                         && upper.get_activeness().is_some_and(|a| a.active_counter > 0);
                     let upper_ids = get_uppers(&upper);
-                    // `upper_id` just lost a follower edge; if that was its last one it may have
-                    // newly become GC-collectible (clause 8 of `gc_maybe_collectible`).
+                    // If that was its last follower edge, `upper_id` may have newly become
+                    // GC-collectible.
                     if upper.is_followers_empty() {
                         ctx.note_gc_edge_loss_candidate(upper_id);
                     }
@@ -2331,8 +2328,8 @@ impl AggregationUpdateQueue {
                 if remove_upper {
                     let data = AggregatedDataUpdate::from_task(&mut follower).invert();
                     let followers = get_followers(&follower);
-                    // `lost_follower_id` just lost an upper edge; if that was its last one it may
-                    // have newly become GC-collectible (clause 7 of `gc_maybe_collectible`).
+                    // If that was its last upper edge, `lost_follower_id` may have newly become
+                    // GC-collectible.
                     if follower.is_upper_empty() {
                         ctx.note_gc_edge_loss_candidate(lost_follower_id);
                     }
@@ -2417,8 +2414,8 @@ impl AggregationUpdateQueue {
                 let has_active_count = ctx.should_track_activeness()
                     && upper.get_activeness().is_some_and(|a| a.active_counter > 0);
                 let upper_ids = get_uppers(&upper);
-                // `upper_id` just lost one or more follower edges; if it now has none it may have
-                // newly become GC-collectible (clause 8 of `gc_maybe_collectible`).
+                // If `upper_id` now has no follower edges it may have newly become
+                // GC-collectible.
                 if upper.is_followers_empty() {
                     ctx.note_gc_edge_loss_candidate(upper_id);
                 }
@@ -3223,10 +3220,9 @@ impl AggregationUpdateQueue {
             AGGREGATION_UPDATE_CATEGORY,
         );
         // Revive the task first if GC soft-deleted it, so the rest of this function (and the
-        // scheduling it drives) sees a live, re-dirtied task. A no-op on the common not-deleted
-        // path (one flag read on the guard we hold), so it is unconditional — only a direct-child
-        // connect can actually observe a deleted task here, but checking always is cheaper than
-        // threading a flag through the job.
+        // scheduling it drives) sees a live, re-dirtied task. Only a direct-child connect can
+        // actually observe a deleted task here, but the check is one flag read on a guard we
+        // already hold — cheaper than threading a flag through the job.
         let mut task = resurrect_deleted(task, task_id, AGGREGATION_UPDATE_CATEGORY, self, ctx);
         self.check_optimization_pending(&task);
         let state = task.get_activeness_mut_or_insert_with(|| ActivenessState::new(task_id));

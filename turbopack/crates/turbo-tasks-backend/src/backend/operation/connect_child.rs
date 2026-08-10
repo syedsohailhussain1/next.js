@@ -19,19 +19,16 @@ use crate::{
 /// Revive `task_id` if it was GC-soft-deleted, given a guard the caller already holds during the
 /// connect handshake. The caller passes that guard **by value** and unconditionally rebinds the
 /// result: `guard = resurrect_deleted(guard, ..)`. When the task is not deleted (the common case)
-/// this is a no-op that returns the same guard untouched — one `deleted()` flag read, no extra
-/// acquisition. Otherwise it revives the task and returns a freshly re-acquired guard of
-/// `category`.
+/// this returns the same guard untouched — one flag read, no extra acquisition.
 ///
 /// On the revival path the guard is dropped and an `All` guard re-acquired (needed for the
-/// `immutable()` read), under which `deleted` is **re-checked** — double-checked locking: between
-/// the peek and this re-acquire, a concurrent connect of the same task could have already revived
-/// it. When still deleted, the clear and the re-dirty happen **under that single `All` guard
-/// without an intervening drop**, so no operation can observe the intermediate `!deleted && !dirty`
-/// state (a task that looks live but still holds the stale/empty edges GC scrubbed). A **mutable**
-/// task is cleared and made dirty so it re-executes and rebuilds those edges; an **immutable** task
-/// cannot be made dirty (invariant in `make_task_dirty`) and does not need to be — its output is
-/// deterministic and its edges self-contained — so clearing the marker alone suffices.
+/// `immutable()` read), under which `deleted` is re-checked: a concurrent connect of the same task
+/// could have revived it in the gap. When still deleted, the clear and the re-dirty happen under
+/// that single guard **without an intervening drop**, so no operation can observe the intermediate
+/// `!deleted && !dirty` state — a task that looks live but still holds the stale/empty edges GC
+/// scrubbed. A mutable task is made dirty so it re-executes and rebuilds those edges; an immutable
+/// task cannot be made dirty (invariant in `make_task_dirty`) and does not need to be, since its
+/// output is deterministic and its edges self-contained.
 ///
 /// GC is the only producer of the `deleted` flag and runs under an exclusion, so once cleared here
 /// it cannot be re-set concurrently.
@@ -147,7 +144,7 @@ impl ConnectChildOperation {
             // yet, and concurrent connects race to be the one that first touches it.
             let child_task = ctx.open_or_create_task_storage(child_task_id, TaskDataCategory::Meta);
 
-            // Revive the child if GC soft-deleted it.  This can happen in a rare race between a
+            // Revive the child if GC soft-deleted it. This can happen in a rare race between a
             // cache hit on a task and snapshotting actually performing the delete.
             let mut child_task = resurrect_deleted(
                 child_task,

@@ -12,12 +12,9 @@
 //! `stop`, the background job loop, the `Backend` trait's `pin_task_for_gc`/`unpin_task_for_gc`)
 //! live in `mod.rs`.
 
-use std::{
-    ops::ControlFlow,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::{ops::ControlFlow, sync::atomic::Ordering};
 
-use turbo_tasks::{TaskId, TurboTasks, scope::scope_unbounded};
+use turbo_tasks::{TaskId, TurboTasks, scope::scope_unbounded_with};
 
 use crate::backend::{
     TurboTasksBackend,
@@ -48,12 +45,26 @@ enum GcJob {
 }
 
 /// Observability counters for one [`TurboTasksBackend::gc_collect`] pass.
+///
+/// Accumulated per drainer and folded at the join (see [`GcStats::merge`]) rather than through
+/// shared atomics: at one increment per collected task across every worker, shared counters were
+/// several percent of collect time in profiles.
 #[derive(Default)]
 pub(crate) struct GcStats {
     /// Tasks collected (marked soft-deleted).
     pub collected: usize,
     /// Edges torn down across all collected tasks (children + forward-dependency reverse edges).
     pub edges_deleted: usize,
+}
+
+impl GcStats {
+    /// Combines two drainers' counts. Addition, so associative and commutative as
+    /// [`scope_unbounded_with`] requires.
+    fn merge(mut self, other: Self) -> Self {
+        self.collected += other.collected;
+        self.edges_deleted += other.edges_deleted;
+        self
+    }
 }
 
 impl TurboTasksBackend {
@@ -74,7 +85,7 @@ impl TurboTasksBackend {
     /// child that reaches 0), marking them deleted, and buffering an on-disk tombstone for the next
     /// persistence commit.
     ///
-    /// The pass is fully parallel and unbounded via [`scope_unbounded`]: work is a pool of
+    /// The pass is fully parallel and unbounded via [`scope_unbounded_with`]: work is a pool of
     /// [`GcJob`]s — scan a shard, or collect a task — and both kinds spawn more. There are no
     /// synchronization barriers anywhere in the pass, not between the scan and the cascade and not
     /// between cascade levels.
@@ -102,8 +113,8 @@ impl TurboTasksBackend {
     ///   task becomes a collect target only after its last persistent parent was itself collected
     ///   (which removed the edge). So a `Collect` never races a decrement of the same task and
     ///   never `ctx.task`-resurrects a task another job just removed.
-    /// - Per-job results merge into shared atomics, touched once per collected task (not per
-    ///   decrement or per scrub), so they are not a contention hot spot.
+    /// - Per-job counts accumulate into a drainer-local [`GcStats`] and are folded once per drainer
+    ///   at the join, so the pass has no shared counter on its hot path.
     ///
     /// Returns [`GcStats`] for the pass. The on-disk tombstones are not produced here — collected
     /// tasks are left resident with their `deleted` flag set, and the next snapshot derives the
@@ -127,133 +138,140 @@ impl TurboTasksBackend {
             .map(GcJob::ScanShard)
             .collect();
 
-        let collected = AtomicUsize::new(0);
-        let edges_deleted = AtomicUsize::new(0);
-
         // Each job builds its own GC `ExecuteContext`; see the doc above for the concurrency
-        // argument.
-        scope_unbounded(seeds, |spawner, job| {
-            let task_id = match job {
-                GcJob::ScanShard(index) => {
-                    // Enqueue under the shard read lock — `spawn` is just an accounting bump plus a
-                    // queue push, which is what `gc_scan_shard` requires of its callback.
-                    self.storage
-                        .gc_scan_shard(index, |task_id| spawner.spawn(GcJob::Collect(task_id)));
+        // argument. Counts accumulate into a per-drainer `GcStats` and are folded at the join, so
+        // the hot path touches no shared state.
+        scope_unbounded_with(
+            seeds,
+            GcStats::default,
+            |spawner, job, stats| {
+                let task_id = match job {
+                    GcJob::ScanShard(index) => {
+                        // Enqueue under the shard read lock — `spawn` is just an accounting bump
+                        // plus a queue push, which is what `gc_scan_shard`
+                        // requires of its callback.
+                        self.storage
+                            .gc_scan_shard(index, |task_id| spawner.spawn(GcJob::Collect(task_id)));
+                        return ControlFlow::Continue(());
+                    }
+                    GcJob::Collect(task_id) => task_id,
+                };
+                let mut ctx = self.execute_context_gc(turbo_tasks);
+                // `All` restores Data so the edge capture below can read the Data-category dep
+                // sets. The target is resident either way: a scan candidate was
+                // read out of the resident map, and a cascade child was just
+                // decremented through its resident entry.
+                let mut task = ctx.task(task_id, TaskDataCategory::All);
+                // Collectibility was checked when this job was queued, but jobs run concurrently: a
+                // sibling job's cascade can since have collected this task (it is then `deleted`)
+                // or flipped it non-collectible (regained
+                // `activeness`/`in_progress`, or gained an aggregation edge).
+                // Re-check under the guard we now hold and skip rather than delete —
+                // collecting twice would double-run the edge teardown. A task that is still
+                // genuinely garbage is re-selected by a later pass.
+                if !task.is_gc_collectible() {
                     return ControlFlow::Continue(());
                 }
-                GcJob::Collect(task_id) => task_id,
-            };
-            let mut ctx = self.execute_context_gc(turbo_tasks);
-            // `All` restores Data so the edge capture below can read the Data-category dep sets.
-            // The target is resident either way: a scan candidate was read out of the resident map,
-            // and a cascade child was just decremented through its resident entry.
-            let mut task = ctx.task(task_id, TaskDataCategory::All);
-            // Collectibility was checked when this job was queued, but jobs run concurrently: a
-            // sibling job's cascade can since have collected this task (it is then `deleted`) or
-            // flipped it non-collectible (regained `activeness`/`in_progress`, or gained an
-            // aggregation edge). Re-check under the guard we now hold and skip rather than delete —
-            // collecting twice would double-run the edge teardown. A task that is still genuinely
-            // garbage is re-selected by a later pass.
-            if !task.is_gc_collectible() {
-                return ControlFlow::Continue(());
-            }
 
-            // Soft-delete rather than remove: a later `ctx.task` on a removed task would resurrect
-            // it from disk as a zombie, so it stays resident until a later step hard-deletes it.
-            // Order relative to the `CleanupOldEdges` run below doesn't matter — `deleted` only
-            // affects snapshot/eviction/collectibility, none of which the cleanup consults for
-            // `task_id` itself.
-            task.set_deleted(true);
-            if task.new_task() {
-                // Never persisted: there is nothing on disk to tombstone, so drop it out of the
-                // next snapshot's scan entirely (clearing its modified bits + shard count).
-                // Eviction still removes the resident, soft-`deleted` task.
-                task.discard_modifications_for_gc_new_task();
-            } else {
-                // Persisted: force the task into the next snapshot's scan so `process` tombstones
-                // its on-disk copy. `deleted` is transient (never persisted), so setting it tracks
-                // nothing — explicitly track a meta modification. This matters even in the
-                // collectible states that otherwise leave meta clean (e.g. a pinned parentless task
-                // then unpinned, or one restored parentless from a prior session).
-                let _ = task.track_modification(SpecificTaskDataCategory::Meta, "gc_deleted");
-            }
-            collected.fetch_add(1, Ordering::Relaxed);
+                // Soft-delete rather than remove: a later `ctx.task` on a removed task would
+                // resurrect it from disk as a zombie, so it stays resident until a
+                // later step hard-deletes it. Order relative to the
+                // `CleanupOldEdges` run below doesn't matter — `deleted` only
+                // affects snapshot/eviction/collectibility, none of which the cleanup consults for
+                // `task_id` itself.
+                task.set_deleted(true);
+                if task.new_task() {
+                    // Never persisted: there is nothing on disk to tombstone, so drop it out of the
+                    // next snapshot's scan entirely (clearing its modified bits + shard count).
+                    // Eviction still removes the resident, soft-`deleted` task.
+                    task.discard_modifications_for_gc_new_task();
+                } else {
+                    // Persisted: force the task into the next snapshot's scan so `process`
+                    // tombstones its on-disk copy. `deleted` is transient
+                    // (never persisted), so setting it tracks
+                    // nothing — explicitly track a meta modification. This matters even in the
+                    // collectible states that otherwise leave meta clean (e.g. a pinned parentless
+                    // task then unpinned, or one restored parentless from a
+                    // prior session).
+                    let _ = task.track_modification(SpecificTaskDataCategory::Meta, "gc_deleted");
+                }
+                stats.collected += 1;
 
-            // Capture all of this task's edges and hand them to the same `CleanupOldEdges`
-            // operation a re-executing task uses. Besides dropping each child's `parent_count` and
-            // scrubbing forward-dep reverse edges, this propagates the aggregation rebalance
-            // (removing this task from its children's `upper` sets) — without it, collected
-            // children would keep a dangling upper edge and never become collectible. The op opens
-            // `ctx.task(task_id)`, so it must run while `task_id` is still resident.
-            let mut old_edges: Vec<OutdatedEdge> = Vec::new();
-            old_edges.extend(task.iter_children().map(OutdatedEdge::Child));
-            old_edges.extend(
-                task.iter_output_dependencies()
-                    .map(OutdatedEdge::OutputDependency),
-            );
-            old_edges.extend(
-                task.iter_cell_dependencies()
-                    .map(OutdatedEdge::CellDependency),
-            );
-            old_edges.extend(
-                task.iter_cell_dependencies_hashed()
-                    .map(|(r, k)| OutdatedEdge::HashedCellDependency(r, k)),
-            );
-            old_edges.extend(
-                task.iter_collectibles_dependencies()
-                    .map(OutdatedEdge::CollectiblesDependency),
-            );
-            drop(task);
-
-            edges_deleted.fetch_add(old_edges.len(), Ordering::Relaxed);
-            CleanupOldEdgesOperation::run(
-                task_id,
-                old_edges,
-                AggregationUpdateQueue::new(),
-                &mut ctx,
-            );
-
-            // `CleanupOldEdges` recorded every child whose persistent `parent_count` reached 0.
-            // Re-check collectibility under each child's guard (count 0 alone isn't enough — it
-            // could be pinned, a root, or still hold aggregation edges) and spawn a job for the
-            // collectible ones. Each child reaches 0 exactly once, so there is no double-queueing.
-            // `Meta` suffices — `is_gc_collectible` reads only Meta fields — and a child that turns
-            // out collectible re-opens with `All` in its own `Collect` job (restore is cached), so
-            // fetching `All` here would only waste a Data restore on the non-collectible children.
-            for child in ctx.take_gc_parent_count_zeroed() {
-                debug_assert!(
-                    !child.is_transient(),
-                    "gc: a transient task should never have a persistent parent_count to zero"
+                // Capture all of this task's edges and hand them to the same `CleanupOldEdges`
+                // operation a re-executing task uses. Besides dropping each child's `parent_count`
+                // and scrubbing forward-dep reverse edges, this propagates the
+                // aggregation rebalance (removing this task from its children's
+                // `upper` sets) — without it, collected children would keep a
+                // dangling upper edge and never become collectible. The op opens
+                // `ctx.task(task_id)`, so it must run while `task_id` is still resident.
+                let mut old_edges: Vec<OutdatedEdge> = Vec::new();
+                old_edges.extend(task.iter_children().map(OutdatedEdge::Child));
+                old_edges.extend(
+                    task.iter_output_dependencies()
+                        .map(OutdatedEdge::OutputDependency),
                 );
-                // The child had its `parent_count` decremented during this task's cleanup, so it is
-                // resident.
-                if ctx.task(child, TaskDataCategory::Meta).is_gc_collectible() {
-                    spawner.spawn(GcJob::Collect(child));
-                }
-            }
+                old_edges.extend(
+                    task.iter_cell_dependencies()
+                        .map(OutdatedEdge::CellDependency),
+                );
+                old_edges.extend(
+                    task.iter_cell_dependencies_hashed()
+                        .map(|(r, k)| OutdatedEdge::HashedCellDependency(r, k)),
+                );
+                old_edges.extend(
+                    task.iter_collectibles_dependencies()
+                        .map(OutdatedEdge::CollectiblesDependency),
+                );
+                drop(task);
 
-            // `CleanupOldEdges` also recorded every task whose last aggregation edge (`upper` /
-            // `followers`) was removed by this cleanup. These did not lose a persistent parent;
-            // they matter because a task already at `parent_count == 0` but held back by the
-            // aggregation-emptiness clauses of `is_gc_collectible` may have just now satisfied
-            // them. Dedup is inherent: a task `Collect`ed here (or by the count-zeroed loop)
-            // soft-deletes itself and fails `is_gc_collectible` on any later look.
-            for candidate in ctx.take_gc_edge_loss_candidates() {
-                // The candidate's guard was mutated in this cascade, so it is resident.
-                if ctx
-                    .task(candidate, TaskDataCategory::Meta)
-                    .is_gc_collectible()
-                {
-                    spawner.spawn(GcJob::Collect(candidate));
-                }
-            }
-            ControlFlow::Continue(())
-        });
+                stats.edges_deleted += old_edges.len();
+                CleanupOldEdgesOperation::run(
+                    task_id,
+                    old_edges,
+                    AggregationUpdateQueue::new(),
+                    &mut ctx,
+                );
 
-        GcStats {
-            collected: collected.into_inner(),
-            edges_deleted: edges_deleted.into_inner(),
-        }
+                // `CleanupOldEdges` recorded every child whose persistent `parent_count` reached 0.
+                // Re-check collectibility under each child's guard (count 0 alone isn't enough — it
+                // could be pinned, a root, or still hold aggregation edges) and spawn a job for the
+                // collectible ones. Each child reaches 0 exactly once, so there is no
+                // double-queueing. `Meta` suffices — `is_gc_collectible` reads only
+                // Meta fields — and a child that turns out collectible re-opens
+                // with `All` in its own `Collect` job (restore is cached), so
+                // fetching `All` here would only waste a Data restore on the non-collectible
+                // children.
+                for child in ctx.take_gc_parent_count_zeroed() {
+                    debug_assert!(
+                        !child.is_transient(),
+                        "gc: a transient task should never have a persistent parent_count to zero"
+                    );
+                    // The child had its `parent_count` decremented during this task's cleanup, so
+                    // it is resident.
+                    if ctx.task(child, TaskDataCategory::Meta).is_gc_collectible() {
+                        spawner.spawn(GcJob::Collect(child));
+                    }
+                }
+
+                // `CleanupOldEdges` also recorded every task whose last aggregation edge (`upper` /
+                // `followers`) was removed by this cleanup. These did not lose a persistent parent;
+                // they matter because a task already at `parent_count == 0` but held back by the
+                // aggregation-emptiness clauses of `is_gc_collectible` may have just now satisfied
+                // them. Dedup is inherent: a task `Collect`ed here (or by the count-zeroed loop)
+                // soft-deletes itself and fails `is_gc_collectible` on any later look.
+                for candidate in ctx.take_gc_edge_loss_candidates() {
+                    // The candidate's guard was mutated in this cascade, so it is resident.
+                    if ctx
+                        .task(candidate, TaskDataCategory::Meta)
+                        .is_gc_collectible()
+                    {
+                        spawner.spawn(GcJob::Collect(candidate));
+                    }
+                }
+                ControlFlow::Continue(())
+            },
+            GcStats::merge,
+        )
     }
 
     /// Body of [`Backend::pin_task_for_gc`](turbo_tasks::backend::Backend::pin_task_for_gc); the

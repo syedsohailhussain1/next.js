@@ -33,6 +33,11 @@ fn enabled() -> bool {
 /// `TempDir` is returned so it lives as long as the backend). GC is invoked directly via
 /// `gc_for_testing`, which does not consult the `TURBO_ENGINE_GC` env var, so nothing global needs
 /// setting.
+///
+/// `num_workers: None` takes the production default (`available_parallelism`), which is what sizes
+/// the storage map's shard count. It must stay consistent with the runtime's `worker_threads` in
+/// [`gc`] — those two independently control shard count and GC drainer count, and setting them
+/// apart measures a configuration that never occurs in production. See the note there.
 fn create_tt() -> (Arc<TurboTasks<TurboTasksBackend>>, tempfile::TempDir) {
     let parent = std::path::PathBuf::from(format!("{}/.cache", env!("CARGO_TARGET_TMPDIR")));
     std::fs::create_dir_all(&parent).unwrap();
@@ -42,7 +47,7 @@ fn create_tt() -> (Arc<TurboTasks<TurboTasksBackend>>, tempfile::TempDir) {
         .unwrap();
     let tt = TurboTasks::new(TurboTasksBackend::new(
         BackendOptions {
-            num_workers: Some(std::thread::available_parallelism().map_or(4, |n| n.get())),
+            num_workers: None,
             small_preallocation: false,
             storage_mode: Some(turbo_tasks_backend::StorageMode::ReadWriteOnShutdown),
             eviction_mode: EvictionMode::Full,
@@ -142,9 +147,15 @@ pub fn gc(c: &mut Criterion) {
         let garbage = (2 * width) as u64;
         group.throughput(Throughput::Elements(garbage));
         group.bench_with_input(BenchmarkId::new("wide", garbage), &width, |b, &width| {
+            // Must match `create_tt`'s `num_workers`. `scope_unbounded` derives its drainer count
+            // from the runtime's worker count, while the shard count comes from the backend's
+            // `num_workers`; production sets both from `available_parallelism`, so pinning one and
+            // not the other measures a shape that never ships. It also matters a lot: GC currently
+            // gets *slower* with more drainers (~2.25x from 4 to 14 threads at wide/50000), so a
+            // low `worker_threads` here would flatter every contention measurement.
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
-                .worker_threads(4)
+                .worker_threads(std::thread::available_parallelism().map_or(4, |n| n.get()))
                 .build()
                 .unwrap();
             // PerIteration: each collect consumes its garbage, so every iteration needs a freshly

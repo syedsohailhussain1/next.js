@@ -266,15 +266,16 @@ describe('interception-dynamic-segment', () => {
        * Test Case 4: Has @sidebar but NO page.tsx (THE KEY BUG CASE)
        * Structure: @modal/(.)test-nested/@sidebar/page.tsx (NO page.tsx at root)
        * Expected: Should work WITHOUT explicit default.tsx
-       * Reason: The partial response omits children so the active slot is retained
+       * Reason: The intercepted layout only declares @sidebar, so it should not
+       * synthesize a missing children slot.
        *
-       * The response must not encode retention as a __DEFAULT__ route-tree
-       * branch. The existing children subtree, including client state, should
-       * remain mounted after the intercepted slot is updated.
+       * The response must not encode the nonexistent slot as a __DEFAULT__
+       * route-tree branch. The outer children subtree, including client state,
+       * should remain mounted after the intercepted slot is updated.
        *
        * With createRouterAct (no allowErrorStatusCodes), 404 fails the test.
        */
-      it('should omit the retained slot and preserve its client state', async () => {
+      it('should omit undeclared children and preserve parent state', async () => {
         const { act, browser } = await createBrowserWithRouterAct('/')
 
         await browser.elementById('retained-counter').click()
@@ -294,6 +295,23 @@ describe('interception-dynamic-segment', () => {
           const modalContent = await browser.elementByCss('#modal').text()
           expect(modalContent).toContain('Intercepted test-nested sidebar')
         })
+
+        const interceptedLayoutSlots = await browser.eval(`(() => {
+          const root = window.history.state?.__PRIVATE_NEXTJS_INTERNALS_TREE?.tree
+
+          function findSidebarOwner(node) {
+            if (!node) return null
+            if ('sidebar' in node[1]) return Object.keys(node[1]).sort()
+            for (const child of Object.values(node[1])) {
+              const result = findSidebarOwner(child)
+              if (result) return result
+            }
+            return null
+          }
+
+          return findSidebarOwner(root?.[1]?.modal)
+        })()`)
+        expect(interceptedLayoutSlots).toEqual(['sidebar'])
 
         await retry(async () => {
           // Children slot should still show original page (/)

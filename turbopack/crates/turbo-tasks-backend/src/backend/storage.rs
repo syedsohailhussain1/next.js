@@ -533,9 +533,8 @@ impl Storage {
         Some(f(task.value()))
     }
 
-    /// Mutable access to a resident task **without** inserting a blank entry for a missing key
-    /// (unlike [`Storage::access_mut`], which resurrects a blank `TaskStorage`). Returns `None` if
-    /// the task is not resident. Used by the non-inserting
+    /// Mutable access to a resident task, returning `None` for a missing key instead of inserting a
+    /// blank `TaskStorage` the way [`Storage::access_mut`] does. Used by the non-inserting
     /// [`ExecuteContext::resident_task`](crate::backend::operation::ExecuteContext::resident_task)
     /// path (GC pin/unpin), where a missing entry means the caller is referencing an
     /// already-collected task and inserting a blank would be a bug.
@@ -547,10 +546,9 @@ impl Storage {
         })
     }
 
-    /// The number of **persistent** (non-transient) tasks resident in the map. GC only collects
-    /// persistent tasks (transient tasks are never collected), so this is the metric that must
-    /// return to a flat baseline across re-rooting; the raw `resident_task_count` also includes
-    /// transient roots (e.g. `run_once`/Once tasks) that GC never touches.
+    /// The number of **persistent** (non-transient) tasks resident in the map. GC never collects
+    /// transient tasks (e.g. `run_once`/Once roots), so this — unlike `resident_task_count` — is
+    /// the metric that must return to a flat baseline across re-rooting.
     pub fn resident_persistent_task_count(&self) -> usize {
         let mut persistent = 0;
         for shard in self.map.shards() {
@@ -603,8 +601,7 @@ impl Storage {
 
     /// The number of shards in the resident map. GC seeds one `ScanShard` job per index; the slice
     /// returned by `map.shards()` is fixed for the map's lifetime, so an index is a stable handle
-    /// to one shard (the same property `shard_modified_counts` and the `snapshots` map already
-    /// rely on).
+    /// to one shard.
     pub fn shard_count(&self) -> usize {
         self.map.shards().len()
     }
@@ -612,9 +609,8 @@ impl Storage {
     /// Scans a **single** shard by index, invoking `on_candidate` for each resident, non-transient
     /// task whose storage passes the cheap [`TaskStorage::gc_maybe_collectible`] pre-filter.
     ///
-    /// GC drives one of these per shard as a job in its main pool, so discovered candidates flow
-    /// straight into the same queue the collect jobs drain. `on_candidate` runs while the shard
-    /// **read lock is held**, so it must be cheap and must not re-enter the map.
+    /// `on_candidate` runs while the shard **read lock is held**, so it must be cheap and must not
+    /// re-enter the map.
     ///
     /// The scan only sees resident tasks; disk-only garbage is collected after it is next restored.
     ///
@@ -703,12 +699,11 @@ impl Storage {
                     continue;
                 }
                 // GC hard-delete: a task still flagged `deleted` here was collected and its on-disk
-                // copy was tombstoned by the snapshot that just committed (its `deleted` flag is
-                // re-checked under this shard write lock — a resurrection between the snapshot and
-                // now clears the flag, in which case we fall through to normal eviction). Its whole
-                // map entry + task_cache mapping can now be dropped. This is the reclaim path for
-                // the background `ReadWrite` loop; the shutdown drain snapshot drops the whole map
-                // wholesale instead, so it never reaches here.
+                // copy was tombstoned by the snapshot that just committed. The flag is re-checked
+                // under this shard write lock — a resurrection between the snapshot and now clears
+                // it, in which case we fall through to normal eviction. Otherwise the whole map
+                // entry + task_cache mapping can be dropped. (The shutdown drain snapshot drops the
+                // whole map wholesale and never reaches here.)
                 if task.get().flags.deleted() {
                     if let Some(task_type) = task.get().get_persistent_task_type() {
                         // Best-effort inline; defer on contention (same lock-order caution as
@@ -961,11 +956,12 @@ impl StorageWriteGuard<'_> {
     }
 
     /// Clears all modified/new flags for a GC-collected task that was **never persisted**
-    /// (`new_task`), dropping it out of the next snapshot's modified scan (decrementing the shard
-    /// modified count to match). There is nothing on disk to tombstone, so the snapshot must skip
-    /// it entirely; eviction still removes the (soft-`deleted`) task from memory. Must be called
-    /// outside snapshot mode (GC runs before the snapshot starts), so it only touches the
-    /// pre-snapshot `modified` flags + shard count, mirroring `track_modification`'s `bumped`.
+    /// (`new_task`), dropping it out of the next snapshot's modified scan: there is nothing on disk
+    /// to tombstone, so the snapshot must skip it entirely. Eviction still removes the
+    /// (soft-`deleted`) task from memory.
+    ///
+    /// Must be called outside snapshot mode (GC runs before the snapshot starts), so it only
+    /// touches the pre-snapshot `modified` flags + shard count, mirroring `track_modification`.
     pub fn discard_modifications_for_gc_new_task(&mut self) {
         debug_assert!(
             !self.storage.snapshot_mode(),

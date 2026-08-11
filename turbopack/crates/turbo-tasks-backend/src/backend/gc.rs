@@ -7,10 +7,8 @@
 //! operations — and is driven as a fully parallel, unbounded job pool
 //! (see [`TurboTasksBackend::gc_collect`]).
 //!
-//! This module holds the GC-specific logic (the job types, the pool driver, per-job teardown, and
-//! the pin/unpin bookkeeping) as an `impl TurboTasksBackend`. Callers (`snapshot_and_persist`,
-//! `stop`, the background job loop, the `Backend` trait's `pin_task_for_gc`/`unpin_task_for_gc`)
-//! live in `mod.rs`.
+//! The GC-specific logic — job types, the pool driver, per-job teardown, and the pin/unpin
+//! bookkeeping — as an `impl TurboTasksBackend`. Its entry points are called from `mod.rs`.
 
 use std::{ops::ControlFlow, sync::atomic::Ordering};
 
@@ -28,8 +26,7 @@ use crate::backend::{
 
 /// One unit of GC work. Parallelism is *across* jobs (the unbounded pool in
 /// [`TurboTasksBackend::gc_collect`] runs many on different workers); each job is internally
-/// sequential. Both variants produce more work, which flows straight back into the same pool — so
-/// there is no barrier between scanning and collecting, and none between cascade levels.
+/// sequential. Both variants produce more work, which flows straight back into the same pool.
 enum GcJob {
     /// Scan one shard of the resident map (by index) and enqueue its candidates as
     /// [`GcJob::Collect`].
@@ -86,9 +83,8 @@ impl TurboTasksBackend {
     /// persistence commit.
     ///
     /// The pass is fully parallel and unbounded via [`scope_unbounded_with`]: work is a pool of
-    /// [`GcJob`]s — scan a shard, or collect a task — and both kinds spawn more. There are no
-    /// synchronization barriers anywhere in the pass, not between the scan and the cascade and not
-    /// between cascade levels.
+    /// [`GcJob`]s — scan a shard, or collect a task — and both kinds spawn more, so there are no
+    /// synchronization barriers anywhere in the pass.
     ///
     /// Why this is safe to run concurrently under the GC phase (which excludes normal operations
     /// but not the GC jobs from each other):
@@ -113,18 +109,11 @@ impl TurboTasksBackend {
     ///   task becomes a collect target only after its last persistent parent was itself collected
     ///   (which removed the edge). So a `Collect` never races a decrement of the same task and
     ///   never `ctx.task`-resurrects a task another job just removed.
-    /// - Per-job counts accumulate into a drainer-local [`GcStats`] and are folded once per drainer
-    ///   at the join, so the pass has no shared counter on its hot path.
     ///
     /// Returns [`GcStats`] for the pass. The on-disk tombstones are not produced here — collected
     /// tasks are left resident with their `deleted` flag set, and the next snapshot derives the
     /// tombstones from that flag (see `snapshot_and_persist`).
     pub(crate) fn gc_collect(&self, turbo_tasks: &TurboTasks<TurboTasksBackend>) -> GcStats {
-        // Seed the pool with the resident-map scan, split one job per shard. Each shard job applies
-        // the cheap `gc_maybe_collectible` pre-filter under a shard read lock and feeds its hits
-        // back as `Collect` jobs. The scan only sees resident tasks; disk-only garbage is collected
-        // after it is next restored.
-        //
         // TODO(perf): recycle the task ids of collected tasks. `persisted_task_id_factory`
         // (`IdFactoryWithReuse`) can hand out freed ids, and the persisted `next_free_task_id`
         // high-water mark only grows today, so the id space grows unboundedly across churn even
@@ -134,13 +123,13 @@ impl TurboTasksBackend {
         // commit a `get_or_create_task` for the same type could re-mint the id, and the id must not
         // be handed out while any live `OperationVc`/`DetachedVc` still references it. Feed the
         // recycled ids into `persisted_task_id_factory` so the high-water mark can stop growing.
+
+        // The scan only sees resident tasks; disk-only garbage is collected after it is next
+        // restored.
         let seeds: Vec<GcJob> = (0..self.storage.shard_count())
             .map(GcJob::ScanShard)
             .collect();
 
-        // Each job builds its own GC `ExecuteContext`; see the doc above for the concurrency
-        // argument. Counts accumulate into a per-drainer `GcStats` and are folded at the join, so
-        // the hot path touches no shared state.
         scope_unbounded_with(
             seeds,
             GcStats::default,
@@ -148,8 +137,8 @@ impl TurboTasksBackend {
                 let task_id = match job {
                     GcJob::ScanShard(index) => {
                         // Enqueue under the shard read lock — `spawn` is just an accounting bump
-                        // plus a queue push, which is what `gc_scan_shard`
-                        // requires of its callback.
+                        // plus a queue push, which is what `gc_scan_shard` requires of its
+                        // callback.
                         self.storage
                             .gc_scan_shard(index, |task_id| spawner.spawn(GcJob::Collect(task_id)));
                         return ControlFlow::Continue(());
@@ -164,21 +153,17 @@ impl TurboTasksBackend {
                 let mut task = ctx.task(task_id, TaskDataCategory::All);
                 // Collectibility was checked when this job was queued, but jobs run concurrently: a
                 // sibling job's cascade can since have collected this task (it is then `deleted`)
-                // or flipped it non-collectible (regained
-                // `activeness`/`in_progress`, or gained an aggregation edge).
-                // Re-check under the guard we now hold and skip rather than delete —
-                // collecting twice would double-run the edge teardown. A task that is still
-                // genuinely garbage is re-selected by a later pass.
+                // or flipped it non-collectible (regained `activeness`/`in_progress`, or gained an
+                // aggregation edge). Re-check under the guard we now hold and skip rather than
+                // delete — collecting twice would double-run the edge teardown. A task that is
+                // still genuinely garbage is re-selected by a later pass.
                 if !task.is_gc_collectible() {
                     return ControlFlow::Continue(());
                 }
 
                 // Soft-delete rather than remove: a later `ctx.task` on a removed task would
-                // resurrect it from disk as a zombie, so it stays resident until a
-                // later step hard-deletes it. Order relative to the
-                // `CleanupOldEdges` run below doesn't matter — `deleted` only
-                // affects snapshot/eviction/collectibility, none of which the cleanup consults for
-                // `task_id` itself.
+                // resurrect it from disk as a zombie, so it stays resident until a later step
+                // hard-deletes it.
                 task.set_deleted(true);
                 if task.new_task() {
                     // Never persisted: there is nothing on disk to tombstone, so drop it out of the
@@ -187,23 +172,21 @@ impl TurboTasksBackend {
                     task.discard_modifications_for_gc_new_task();
                 } else {
                     // Persisted: force the task into the next snapshot's scan so `process`
-                    // tombstones its on-disk copy. `deleted` is transient
-                    // (never persisted), so setting it tracks
+                    // tombstones its on-disk copy. `deleted` is transient, so setting it tracks
                     // nothing — explicitly track a meta modification. This matters even in the
                     // collectible states that otherwise leave meta clean (e.g. a pinned parentless
-                    // task then unpinned, or one restored parentless from a
-                    // prior session).
+                    // task then unpinned, or one restored parentless from a prior session).
                     let _ = task.track_modification(SpecificTaskDataCategory::Meta, "gc_deleted");
                 }
                 stats.collected += 1;
 
                 // Capture all of this task's edges and hand them to the same `CleanupOldEdges`
                 // operation a re-executing task uses. Besides dropping each child's `parent_count`
-                // and scrubbing forward-dep reverse edges, this propagates the
-                // aggregation rebalance (removing this task from its children's
-                // `upper` sets) — without it, collected children would keep a
-                // dangling upper edge and never become collectible. The op opens
-                // `ctx.task(task_id)`, so it must run while `task_id` is still resident.
+                // and scrubbing forward-dep reverse edges, this propagates the aggregation
+                // rebalance (removing this task from its children's `upper` sets) — without it,
+                // collected children would keep a dangling upper edge and never become collectible.
+                // The op opens `ctx.task(task_id)`, so it must run while `task_id` is still
+                // resident.
                 let mut old_edges: Vec<OutdatedEdge> = Vec::new();
                 old_edges.extend(task.iter_children().map(OutdatedEdge::Child));
                 old_edges.extend(
@@ -236,11 +219,10 @@ impl TurboTasksBackend {
                 // Re-check collectibility under each child's guard (count 0 alone isn't enough — it
                 // could be pinned, a root, or still hold aggregation edges) and spawn a job for the
                 // collectible ones. Each child reaches 0 exactly once, so there is no
-                // double-queueing. `Meta` suffices — `is_gc_collectible` reads only
-                // Meta fields — and a child that turns out collectible re-opens
-                // with `All` in its own `Collect` job (restore is cached), so
-                // fetching `All` here would only waste a Data restore on the non-collectible
-                // children.
+                // double-queueing. `Meta` suffices — `is_gc_collectible` reads only Meta fields —
+                // and a child that turns out collectible re-opens with `All` in its own `Collect`
+                // job (restore is cached), so fetching `All` here would only waste a Data restore
+                // on the non-collectible children.
                 for child in ctx.take_gc_parent_count_zeroed() {
                     debug_assert!(
                         !child.is_transient(),
@@ -289,8 +271,8 @@ impl TurboTasksBackend {
         let mut ctx = self.execute_context(turbo_tasks);
         // A pin is an in-session reference from outside the tracked graph (`prevent_gc`, or a
         // `DetachedVc` holding the task's `OperationVc` across NAPI), counted like a transient
-        // parent's edge: bump `transient_ref_count`, which keeps the task uncollectible and
-        // unevictable while > 0. Counting (not a bool) balances each pin against its own unpin.
+        // parent's edge: `transient_ref_count` keeps the task uncollectible and unevictable while
+        // > 0. Counting (not a bool) balances each pin against its own unpin.
         //
         // `resident_task` is non-inserting: a pin targets a live reference, so the task must be
         // resident. A missing entry means a pin of an already-collected task (a "zombie

@@ -58,26 +58,14 @@ pub fn connect_children(
 
         let mut queue = AggregationUpdateQueue::new();
 
-        // Single pass over the newly-connected children doing two things per child under one guard,
-        // so we don't lock each child twice (once to bump its ref count, once to dirty it):
+        // Single pass over the newly-connected children, two things per child under one guard:
         //
-        // 1. Maintain the child-side parent reference count for **persistent** children: a
-        //    persistent parent bumps the durable `parent_count`, a transient parent the
-        //    session-only `transient_ref_count` (not persisted; transient parents re-establish
-        //    their edges by re-executing on restart). Transient children are never collected, so
-        //    they take no count.
+        // 1. Bump the child-side parent reference count for **persistent** children (transient
+        //    children are never collected, so they take no count).
         //
         //    CRITICAL: the `+1` is applied **directly**, not via a queued `AdjustParentCount` job,
         //    and MUST land before `queue.execute` below (the first `operation_suspend_point` this
-        //    function reaches). GC only observes state at suspend points, so a `+1` riding the
-        //    queue could suspend while still pending — leaving a window where the `children` edge
-        //    is committed (`extend_children` in the caller) but `parent_count` is not yet
-        //    incremented. A GC pass landing there would read `parent_count == 0`, judge the
-        //    genuinely-reachable child collectible, and delete it. In the parallelized path this
-        //    runs on a child context, which never suspends, inside a `scope_and_block` barrier
-        //    that completes within the parent operation. (The `-1` in `CleanupOldEdges` has the
-        //    opposite, benign failure mode — a pending `-1` under-collects for one pass — so it
-        //    stays on the durable queue there.)
+        //    function reaches) so that thew new child and the +1 are atomically observable to GC.
         //
         // 2. Make any child that has not produced output yet dirty, so it gets scheduled and
         //    computes. Runs only on the successful connect (not the stale/cancel early-returns in
@@ -88,8 +76,7 @@ pub fn connect_children(
             new_follower_ids.iter().copied(),
             "connect_children parent_count + dirty",
             |mut child, ctx| {
-                // Ref-count bump first (persistent children only), on the `&mut` borrow, before the
-                // guard may be consumed by `make_task_dirty_internal` below.
+                // Bump before `make_task_dirty_internal`, which consumes the guard.
                 if !child.id().is_transient() {
                     if parent_is_transient {
                         child.update_and_get_transient_ref_count(1);

@@ -152,9 +152,7 @@ struct TaskStorageSchema {
     /// A count can only drop to 0 while the parent is in memory (a parent re-executed and dropped
     /// the child), so collectibility is detectable at that moment with no DB scan.
     // Stored inline (not lazy): `parent_count` is near-universal and mutated on every child-edge
-    // change, so a lazy-Vec scan per access is wasteful. The inline `u32` counts fit within the
-    // size budget asserted by `test_schema_size`. `default` gives absent==0 semantics with a bare
-    // `u32` (no `Option`).
+    // change, so a lazy-Vec scan per access is wasteful.
     #[field(storage = "direct", category = "meta", inline, default)]
     parent_count: u32,
 
@@ -249,15 +247,14 @@ struct TaskStorageSchema {
     pub new_task: bool,
 
     /// GC soft-deletion marker. Set by the garbage collector when a task is collected: its edges
-    /// have been scrubbed and it is destined for deletion, but it stays **resident** (this is a
-    /// transient flag, so eviction's `drop_partial` keeps it as residue) until the next snapshot
-    /// tombstones its on-disk copy and a later step hard-deletes it. Staying resident closes the
-    /// resurrection window — any `ctx.task` on it during the pass finds a real entry rather than
-    /// restoring a zombie from disk. Cleared (and the task marked dirty) if a connect resurrects
-    /// it before the hard-delete. Never persisted: a crash just leaves the task on disk to be
-    /// re-collected next session. Because it is transient, setting it does not implicitly track a
-    /// modification, so the GC mark explicitly calls `track_modification(Meta)` to force the task
-    /// into the next snapshot's scan.
+    /// have been scrubbed and it is destined for deletion, but it stays **resident** until the
+    /// next snapshot tombstones its on-disk copy and a later step hard-deletes it. Staying
+    /// resident closes the resurrection window — any `ctx.task` on it during the pass finds a
+    /// real entry rather than restoring a zombie from disk. Cleared (and the task marked
+    /// dirty) if a connect resurrects it before the hard-delete. Never persisted: a crash just
+    /// leaves the task on disk to be re-collected next session. Because it is a transient
+    /// flag, setting it does not implicitly track a modification, so the GC mark explicitly
+    /// calls `track_modification(Meta)` to force the task into the next snapshot's scan.
     #[field(storage = "flag", category = "transient")]
     deleted: bool,
 
@@ -607,15 +604,15 @@ impl TaskStorage {
             Some(arc) if arc.count() == 1 => KeyEvictability::AlreadyEvicted,
             Some(_) => KeyEvictability::Evictable,
         };
-        // A task with a live transient reference (a `prevent_gc` pin, a detached handle, or a
-        // transient parent — see `transient_ref_count`) is NOT forced fully resident; it falls
-        // through to the normal Meta/Data evictability below. `drop_partial` retains non-default
-        // *transient* fields, so `transient_ref_count` survives as residue and the map entry is
-        // kept (see `DropPartialOutcome::HasResidue`) — the count can never be lost to eviction and
-        // expose a still-referenced task to collection. Such a task also has no resident Meta
-        // afterwards, so it is not immediately collectible even once unpinned, which is safe:
-        // a later access restores Meta and a later pass collects it.
-        //
+        // A task with a live transient reference (`transient_ref_count`: a `prevent_gc` pin, a
+        // detached handle, or a transient parent) is NOT forced fully resident — it falls through
+        // to the normal Meta/Data evictability below. That is safe because `drop_partial`
+        // retains non-default *transient* fields, so `transient_ref_count` survives as
+        // residue and the map entry is kept (`DropPartialOutcome::HasResidue`): the count
+        // can never be lost to eviction and expose a still-referenced task to collection.
+        // Such a task also has no resident Meta afterwards, so `gc_maybe_collectible`
+        // refuses to judge it until a later access restores Meta.
+
         // All these flags imply that the task is currently being used in some way
         // either literally executing, or about to
         if self.get_in_progress().is_some()
@@ -884,25 +881,20 @@ impl TaskStorage {
     }
 
     /// The number of persistent parents referencing this task (0 when the field is absent).
-    /// Read-only accessor over a bare `&TaskStorage` for GC and tests, without widening the
-    /// generated lazy getter's visibility.
     pub fn gc_parent_count(&self) -> u32 {
         self.get_parent_count().copied().unwrap_or(0)
     }
 
-    /// The number of transient (session-only) parents referencing this task (0 when absent).
+    /// The number of transient (session-only) references to this task (0 when absent). See the
+    /// `transient_ref_count` field for what counts as one.
     pub fn gc_transient_ref_count(&self) -> u32 {
         self.get_transient_ref_count().copied().unwrap_or(0)
     }
 
-    /// The storage-only part of GC collectibility: `Meta` is resident, no persistent or transient
-    /// parents, quiescent (not active, not in progress), and no aggregation edges
-    /// (`upper`/`followers`). Does NOT include the transient-*id* check (a `TaskStorage` has no id)
-    /// — the caller must also confirm `!task_id.is_transient()`.
+    /// The storage-only part of GC collectibility. Does NOT include the transient-*id* check (a
+    /// `TaskStorage` has no id) — the caller must also confirm `!task_id.is_transient()`.
     /// [`TaskGuard::is_gc_collectible`](crate::backend::operation::TaskGuard::is_gc_collectible)
-    /// is the authoritative predicate; it adds the id check and delegates here. GC uses this
-    /// bare form to cheaply pre-filter the resident map (see `gc_collect`) without opening a
-    /// guard per task.
+    /// is the authoritative predicate; it adds the id check and delegates here.
     ///
     /// **The `is_restored(Meta)` gate is load-bearing.** `parent_count` and the aggregation-edge
     /// fields are Meta-category, so a task whose `Meta` has been evicted (`drop_partial`) reads
@@ -1181,16 +1173,14 @@ mod tests {
         storage.upper_mut().insert(upper, 1);
         storage.followers_mut().insert(follower, 1);
 
-        // Nothing gone: no dangling edge.
         assert_eq!(storage.first_dangling_aggregation_edge(|_| false), None);
 
-        // The upper target is gone (erased while still referenced): reported.
         assert_eq!(
             storage.first_dangling_aggregation_edge(|t| t == upper),
             Some(upper)
         );
 
-        // The follower target is gone: reported (upper is fine, so it falls through to followers).
+        // Falls through to followers when upper is fine.
         assert_eq!(
             storage.first_dangling_aggregation_edge(|t| t == follower),
             Some(follower)
@@ -1334,9 +1324,8 @@ mod tests {
         original
             .aggregated_dirty_containers_mut()
             .insert(TaskId::new(50).unwrap(), 2);
-        // Persisted parent count.
         original.set_parent_count(3);
-        // Transient parent count (should NOT be serialized).
+        // Transient ref count (should NOT be serialized).
         original.set_transient_ref_count(9);
 
         // Set transient flag (should NOT be serialized)
@@ -1383,7 +1372,6 @@ mod tests {
             decoded.aggregated_dirty_containers(),
             original.aggregated_dirty_containers()
         );
-        // Persisted parent_count survives the round-trip.
         assert_eq!(decoded.get_parent_count(), Some(&3));
         // Transient parent count is NOT serialized; it stays at its default (absent == 0).
         assert_eq!(decoded.get_transient_ref_count(), None);
@@ -1878,11 +1866,9 @@ mod tests {
     // GC soft-deletion
     // ==========================================================================
 
-    /// The `deleted` marker round-trips through its accessors, and — because it is a *transient*
-    /// flag, not Meta — it survives a Meta `drop_partial` (partial eviction). The mark therefore
-    /// remains observable no matter what normal eviction does to the Meta/Data payload, so the
-    /// tombstone + hard-delete logic (which keys off the flag) can't be fooled by a partial
-    /// eviction between the mark and the commit.
+    /// The `deleted` marker is a *transient* flag, not Meta, so it survives a Meta `drop_partial`
+    /// (partial eviction). The tombstone + hard-delete logic keys off the flag, so a partial
+    /// eviction between the mark and the commit must not be able to fool it.
     #[test]
     fn deleted_marker_is_transient_residue() {
         let mut storage = TaskStorage::new();

@@ -11,7 +11,6 @@ use turbo_tasks::{
 };
 use turbo_tasks_backend::{BackendOptions, EvictionMode, GitVersionInfo, TurboTasksBackend};
 
-/// Creates a fresh per-call persistence directory rooted under `CARGO_TARGET_TMPDIR/.cache/`.
 fn create_test_persistence_dir(name: &str) -> tempfile::TempDir {
     let parent = std::path::PathBuf::from(format!("{}/.cache", env!("CARGO_TARGET_TMPDIR")));
     std::fs::create_dir_all(&parent).unwrap();
@@ -83,9 +82,8 @@ async fn branch_b() -> Result<Vc<u32>> {
     Ok(Vc::cell(2 + *leaf(20).await?))
 }
 
-/// A task that pins itself against GC while executing (as code handing a value across an untracked
-/// boundary — e.g. a `spawn_detached` future sending a `Vc` over a channel — would). Once pinned it
-/// must survive collection even after it is disconnected.
+/// A task that pins itself against GC while executing. Once pinned it must survive collection even
+/// after it is disconnected.
 #[turbo_tasks::function]
 async fn pinned_branch() -> Result<Vc<u32>> {
     prevent_gc();
@@ -140,7 +138,6 @@ async fn parent_count_tracks_connect_and_disconnect() {
         let leaf10_id = task_id_of(leaf(10).resolve().await?);
         let branch_b_id = task_id_of(branch_b().resolve().await?);
 
-        // While connected, branch_a and leaf(10) each have exactly one persistent parent.
         assert_eq!(
             tt2.backend().parent_count_for_testing(branch_a_id),
             1,
@@ -156,7 +153,6 @@ async fn parent_count_tracks_connect_and_disconnect() {
         selector.set(true);
         assert_eq!(*output.read_strongly_consistent().await?, 22);
 
-        // branch_a is now disconnected from select: its parent_count drops to 0.
         assert_eq!(
             tt2.backend().parent_count_for_testing(branch_a_id),
             0,
@@ -164,14 +160,12 @@ async fn parent_count_tracks_connect_and_disconnect() {
         );
         // leaf(10) is still listed as a child by the (now-garbage) branch_a — nothing re-executed
         // branch_a to drop that edge — so its parent_count stays 1. It only drops to 0 once
-        // branch_a is torn down by the GC cascade. The count accurately reflects the live
-        // `children` edges at all times.
+        // branch_a is torn down by the GC cascade.
         assert_eq!(
             tt2.backend().parent_count_for_testing(leaf10_id),
             1,
             "leaf(10)'s parent branch_a still lists it (branch_a is garbage but not yet torn down)"
         );
-        // branch_b + leaf(20) are now connected.
         assert_eq!(
             tt2.backend().parent_count_for_testing(branch_b_id),
             1,
@@ -194,9 +188,9 @@ async fn parent_count_tracks_connect_and_disconnect() {
     result.unwrap();
 }
 
-/// `parent_count` is a persisted meta field: it must survive a snapshot + DB reopen. This exercises
-/// the durability path — the count is written into the task's meta blob and restored on the next
-/// session (and any in-flight `AdjustParentCount` job replays via the durable operation queue).
+/// `parent_count` is a persisted meta field: it must survive a snapshot + DB reopen. The count is
+/// written into the task's meta blob and restored on the next session, and any in-flight
+/// `AdjustParentCount` job replays via the durable operation queue.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parent_count_survives_reopen() {
     let dir = create_test_persistence_dir("parent_count_survives_reopen");
@@ -266,9 +260,7 @@ async fn parent_count_survives_reopen() {
 
 /// A decrement (disconnect) must survive a snapshot + eviction and stay correct when the affected
 /// tasks are restored from disk — exercising the `-1` `AdjustParentCount` path through the durable
-/// queue within a single session (so task identity is stable). After the flip, branch_b has 1
-/// persistent parent and branch_a has 0; those counts must be intact after a snapshot/evict cycle
-/// pushes them to disk and a subsequent read restores them.
+/// queue within a single session, so task identity is stable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parent_count_decrement_survives_snapshot_evict() {
     let (tt, _persistence_dir) = create_tt("parent_count_decrement_survives_snapshot_evict");
@@ -296,8 +288,7 @@ async fn parent_count_decrement_survives_snapshot_evict() {
         // Snapshot + evict: pushes quiescent tasks (with their parent_count) to disk.
         tt2.backend().snapshot_and_evict_for_testing(&tt2);
 
-        // Re-read the live output, restoring branch_b from disk; its parent_count must still be 1
-        // (the persisted, decrement-consistent value — not doubled, not lost).
+        // Re-read the live output, restoring branch_b from disk.
         assert_eq!(*output.read_strongly_consistent().await?, 22);
         assert_eq!(*branch_b().await?, 22);
         assert_eq!(
@@ -354,11 +345,10 @@ async fn gc_collects_disconnected_subtree() {
     assert_eq!(
         tt2.backend().gc_for_testing(&tt2),
         0,
-        "nothing left to collect"
+        "a second GC pass must collect nothing"
     );
 
-    // The live graph still computes, and flipping back recomputes branch_a fresh (it was collected)
-    // — proving collection left no dangling references.
+    // Flipping back must recompute branch_a fresh, since it was collected.
     let tt3 = tt.clone();
     let result = turbo_tasks::run_once(tt.clone(), async move {
         let selector_op = create_selector(true);
@@ -378,9 +368,7 @@ async fn gc_collects_disconnected_subtree() {
 }
 
 /// A task that pins itself via `prevent_gc()` must survive collection even after it is disconnected
-/// from the live graph — covering values that escape the tracked task graph (e.g. `spawn_detached`
-/// sending a `Vc` across a channel). Unlike `branch_a`, `pinned_branch` is not collected once
-/// disconnected, because the pin makes it a GC root.
+/// from the live graph, because the pin makes it a GC root.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gc_does_not_collect_pinned_task() {
     let (tt, _persistence_dir) = create_tt("gc_does_not_collect_pinned_task");
@@ -393,7 +381,6 @@ async fn gc_does_not_collect_pinned_task() {
         let selector_vc = selector_op.resolve().strongly_consistent().await?;
         let selector = selector_op.read_strongly_consistent().await?;
 
-        // select_pinned reads pinned_branch, which pins itself during execution.
         let output = select_pinned(selector_vc);
         assert_eq!(*output.read_strongly_consistent().await?, 99);
 
@@ -406,16 +393,15 @@ async fn gc_does_not_collect_pinned_task() {
     .await;
     result.unwrap();
 
-    // GC (after the run releases activeness) must NOT collect pinned_branch even though it is now
-    // disconnected (parent_count 0), because it pinned itself. Its child leaf from branch_b is
-    // live.
+    // GC runs after the run has released activeness, so pinned_branch is disconnected
+    // (parent_count 0) and otherwise collectible.
     let collected = tt2.backend().gc_for_testing(&tt2);
     assert_eq!(
         collected, 0,
         "a pinned task must not be collected even when disconnected"
     );
 
-    // A snapshot + evict must not lose the (transient) pin. A pinned task is no longer forced fully
+    // A snapshot + evict must not lose the (transient) pin. A pinned task is not forced fully
     // resident — its Meta/Data may be partially evicted — but the session-only
     // `transient_ref_count` is retained as residue (the map entry is kept), so the task stays
     // uncollectible and a subsequent GC still collects nothing.
@@ -458,8 +444,7 @@ async fn unpin_after_stop_does_not_panic() {
     tt.unpin_task_for_gc(leaf_id);
 }
 
-/// Reads a *stable* child (`leaf(30)`) on every execution, plus a `State` that drives
-/// re-execution. Flipping the state re-executes the parent while it keeps the same child edge.
+/// Re-executes when the selector flips while keeping the same child edge.
 #[turbo_tasks::function(operation, root)]
 async fn stable_child_parent(selector: ResolvedVc<Selector>) -> Result<Vc<u32>> {
     // Read the selector so we re-execute when it flips...
@@ -492,8 +477,7 @@ async fn wide_parent() -> Result<Vc<u32>> {
 
 /// The parallelized `connect_children` path (≥10_000 children, chunked across worker contexts)
 /// must bump each persistent child's `parent_count` exactly once — no child dropped by a chunk
-/// boundary, none double-counted. Connect >10_000 distinct children in one parent and assert a
-/// spread of them (first / middle / last, covering multiple chunks) each end at exactly 1.
+/// boundary, none double-counted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parent_count_wide_fanout_parallel_path() {
     let (tt, _persistence_dir) = create_tt("parent_count_wide_fanout_parallel_path");
@@ -511,8 +495,7 @@ async fn parent_count_wide_fanout_parallel_path() {
             assert_eq!(
                 tt2.backend().parent_count_for_testing(child_id),
                 1,
-                "wide_leaf({index}) must have parent_count == 1 after the parallel connect \
-                 (chunked +1 must bump every child exactly once)"
+                "wide_leaf({index}) must have parent_count == 1 after the parallel connect"
             );
         }
 
@@ -557,8 +540,7 @@ async fn parent_count_not_double_counted_on_revalidation() {
             assert_eq!(
                 tt2.backend().parent_count_for_testing(leaf30_id),
                 1,
-                "leaf(30)'s parent_count must stay 1 across re-validation (iteration {i}), not \
-                 grow — the child edge already existed so no new count is taken"
+                "leaf(30)'s parent_count must stay 1 across re-validation, grew at iteration {i}"
             );
         }
 
@@ -570,10 +552,10 @@ async fn parent_count_not_double_counted_on_revalidation() {
 }
 
 /// A selector-gated root over the wide fanout, so flipping disconnects the whole `wide_parent`
-/// subtree cleanly (like `select` does for `branch_a`). `wide_parent` accumulates `WIDE_FANOUT`
-/// distinct children — enough to promote it to an aggregating node — so disconnecting it exercises
-/// both GC discovery buffers: `wide_parent` loses its last persistent parent (count-zeroed) and the
-/// aggregation-graph rebalance that frees the leaves runs during the same cascade.
+/// subtree cleanly. `wide_parent` has enough children to be promoted to an aggregating node, so
+/// disconnecting it exercises both GC discovery buffers: `wide_parent` loses its last persistent
+/// parent (count-zeroed) and the aggregation-graph rebalance that frees the leaves runs during the
+/// same cascade.
 #[turbo_tasks::function(operation, root)]
 async fn select_wide(selector: ResolvedVc<Selector>) -> Result<Vc<u32>> {
     let use_wide = !*selector.await?.get();
@@ -597,8 +579,6 @@ async fn build_and_disconnect_wide(tt: Arc<TurboTasks<TurboTasksBackend>>) {
         let output = select_wide(selector_vc);
         output.read_strongly_consistent().await?;
 
-        // Flip: select_wide re-executes reading the trivial branch, disconnecting wide_parent and
-        // its whole subtree in one shot.
         selector.set(true);
         output.read_strongly_consistent().await?;
         anyhow::Ok(())
@@ -608,10 +588,8 @@ async fn build_and_disconnect_wide(tt: Arc<TurboTasks<TurboTasksBackend>>) {
 }
 
 /// A whole wide **aggregating** subtree, disconnected cleanly, must be reclaimed in a *single* GC
-/// pass. `wide_parent` is promoted to an aggregating node over `WIDE_FANOUT` leaves, so collecting
-/// it must both drop every leaf's `parent_count` and rebalance away every leaf's `upper` edge in
-/// the same pass — the end-to-end invariant the GC discovery buffers (count-zeroed + edge-loss)
-/// exist to uphold.
+/// pass: collecting `wide_parent` must both drop every leaf's `parent_count` and rebalance away
+/// every leaf's `upper` edge in the same pass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gc_collects_wide_aggregating_subtree_in_one_pass() {
     let dir = create_test_persistence_dir("gc_collects_wide_aggregating_subtree_in_one_pass");
@@ -625,9 +603,8 @@ async fn gc_collects_wide_aggregating_subtree_in_one_pass() {
     tt2.backend().snapshot_and_evict_for_testing(&tt2);
     let after = tt2.backend().resident_persistent_task_count_for_testing();
 
-    // wide_parent + WIDE_FANOUT leaves, collected together in one pass. Without the aggregation
-    // rebalance a leaf would keep a dangling `upper` edge to the deleted parent, fail
-    // `gc_maybe_collectible`, and leak until eviction hid it.
+    // Without the aggregation rebalance a leaf keeps a dangling `upper` edge to the deleted parent,
+    // fails `gc_maybe_collectible`, and leaks until eviction hides it.
     assert_eq!(
         collected,
         WIDE_FANOUT as usize + 1,

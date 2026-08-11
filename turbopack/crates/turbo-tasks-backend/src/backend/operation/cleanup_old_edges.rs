@@ -106,11 +106,9 @@ impl CleanupOldEdgesOperation {
                                         removed_persistent_children.push(*child_id);
                                     }
                                 }
-                                // Each removed persistent child loses a parent. The queued job
-                                // drops the right counter (durable `parent_count` for a persistent
-                                // parent, session-only `transient_ref_count` for a transient one)
-                                // and takes the child guards, avoiding a second guard while `task`
-                                // is held.
+                                // Each removed persistent child loses a parent. Queued rather than
+                                // applied inline because the job takes the child guards, avoiding a
+                                // second guard while `task` is held.
                                 if !removed_persistent_children.is_empty() {
                                     let job = if task_id.is_transient() {
                                         AggregationUpdateJob::AdjustTransientRefCount {
@@ -250,8 +248,7 @@ impl CleanupOldEdgesOperation {
                                     dependent_task = %task_id
                                 )
                                 .entered();
-                                // See the CellDependency arm: under GC the target must stay
-                                // resident; a non-resident one would resurrect a collected task.
+                                // See the CellDependency arm above.
                                 debug_assert!(
                                     ctx.gc_target_resident(output_task_id) != Some(false),
                                     "gc: CleanupOldEdges({task_id}) output-dep target \

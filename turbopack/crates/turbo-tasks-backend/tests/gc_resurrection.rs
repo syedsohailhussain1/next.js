@@ -2,8 +2,8 @@
 #![feature(arbitrary_self_types_pointers)]
 #![allow(clippy::needless_return)] // tokio macro-generated code doesn't respect this
 
-//! Regression tests for GC teardown of a cleanly-disconnected subtree whose tasks hold real
-//! forward-dependency edges on each other.
+//! GC teardown of a cleanly-disconnected subtree whose tasks hold real forward-dependency edges on
+//! each other.
 //!
 //! The central invariant: when a task `S` that is the `upper` of its children is collected, GC
 //! must **rebalance the aggregation graph** — remove `S` from each child's `upper` set — so the
@@ -68,11 +68,10 @@ fn create_selector(initial: bool) -> Vc<Selector> {
     Selector(State::new(initial)).cell()
 }
 
-/// A separate long-lived State whose *value never changes*, only read by the leaves. Reading it
-/// makes each leaf **mutable** (so a reader records a real dependency edge on the leaf) WITHOUT the
-/// aggregation-heavy `session_dependent` machinery that keeps a task active. The state task is a
-/// root, so it stays alive; the leaves depend on it via a dependency edge (not a child edge), so
-/// disconnecting the leaves as children should still let them lose activeness.
+/// A long-lived State whose *value never changes*, read by the leaves purely to make each leaf
+/// **mutable**, so a reader records a real dependency edge on it. The state task is a root and
+/// stays alive; the leaves reach it via a dependency edge, not a child edge, so disconnecting the
+/// leaves as children still lets them lose activeness.
 #[turbo_tasks::value(transparent)]
 struct Constant(State<u32>);
 
@@ -81,9 +80,8 @@ fn create_constant() -> Vc<Constant> {
     Constant(State::new(0)).cell()
 }
 
-/// The forward-dependency *target*. Reading `constant`'s State makes it mutable (records
-/// dependents) — an immutable constant task would record none. `FANOUT` distinct leaves per reader
-/// give many chances for the racing interleaving.
+/// The forward-dependency *target*: mutable because it reads `constant`'s State. `FANOUT` distinct
+/// leaves per reader give many chances for the racing interleaving.
 #[turbo_tasks::function]
 async fn sd_leaf(constant: ResolvedVc<Constant>, index: u32) -> Result<Vc<u32>> {
     let base = *constant.await?.get();
@@ -105,8 +103,7 @@ async fn reader(constant: ResolvedVc<Constant>) -> Result<Vc<u32>> {
     Ok(Vc::cell(sum))
 }
 
-/// A *sibling* forward-dependency target for the diamond fixture (`B`). Mutable (reads the
-/// constant State), so a reader records a real dependency edge on it.
+/// A *sibling* forward-dependency target for the diamond fixture (`B`).
 #[turbo_tasks::function]
 async fn diamond_target(constant: ResolvedVc<Constant>, index: u32) -> Result<Vc<u32>> {
     let base = *constant.await?.get();
@@ -124,11 +121,9 @@ async fn diamond_reader(target: ResolvedVc<u32>) -> Result<Vc<u32>> {
     Ok(Vc::cell(1 + *target.await?))
 }
 
-/// The diamond root: for each index, calls `diamond_target(index)` (`B`, so `B` is the root's
-/// child) and `diamond_reader(B)` (`A`, passing `B`'s resolved Vc in, so `A` is the root's child
-/// and forward-deps on `B` but does NOT parent it). Disconnecting the root drops both `A` and `B`
-/// as siblings; collecting the root cascades a `Collect` for every `A` and `B` at once, so a `B`
-/// can be collected before the `Collect(A)` whose `CleanupOldEdges` opens it.
+/// The diamond root: parents both `A` and `B` as siblings, so collecting the root cascades a
+/// `Collect` for every `A` and `B` at once — a `B` can therefore be collected before the
+/// `Collect(A)` whose `CleanupOldEdges` opens it.
 #[turbo_tasks::function]
 async fn diamond_root(constant: ResolvedVc<Constant>) -> Result<Vc<u32>> {
     let mut sum = 0u32;
@@ -153,7 +148,6 @@ async fn select_reader(
     let value = if use_reader {
         *reader(*constant).await?
     } else {
-        // A trivial branch with no dependency on `reader`/`sd_leaf`.
         0u32
     };
     Ok(Vc::cell(value))
@@ -175,19 +169,17 @@ async fn select_diamond(
     Ok(Vc::cell(value))
 }
 
-/// The **aggregation-graph rebalance** in GC: `reader` is the sole `upper` of each `sd_leaf` (it
-/// reads them, and they are mutable so the edge is recorded). When the `reader` subtree is
-/// disconnected cleanly and collected, GC must remove `reader` from each leaf's `upper` set so the
-/// leaves — now parentless *and* upper-less — cascade-collect in the same pass. Without the
-/// rebalance a leaf keeps a dangling `upper` edge to the deleted `reader`, fails
-/// `gc_maybe_collectible`, and leaks until eviction hides it.
+/// The **aggregation-graph rebalance** in GC: when the `reader` subtree is disconnected cleanly and
+/// collected, GC must remove `reader` from each `sd_leaf`'s `upper` set so the leaves — now
+/// parentless *and* upper-less — cascade-collect in the same pass. Without the rebalance a leaf
+/// keeps a dangling `upper` edge to the deleted `reader`, fails `gc_maybe_collectible`, and leaks
+/// until eviction hides it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn gc_rebalances_aggregation_and_cascades_in_one_pass() {
     let (tt, _persistence_dir) = create_tt("gc_rebalances_aggregation_and_cascades_in_one_pass");
     let tt2 = tt.clone();
 
-    // Build the graph (selector=false: select_reader -> reader -> FANOUT sd_leaves), then flip to
-    // disconnect the whole reader subtree cleanly.
+    // Build the graph (selector=false: select_reader -> reader -> FANOUT sd_leaves).
     let result = turbo_tasks::run_once(tt.clone(), async move {
         unmark_top_level_task_may_leak_eventually_consistent_state();
         let selector_op = create_selector(false);
@@ -211,19 +203,15 @@ async fn gc_rebalances_aggregation_and_cascades_in_one_pass() {
     // Baseline resident count with the reader subtree disconnected but not yet collected.
     let baseline = tt2.backend().resident_persistent_task_count_for_testing();
 
-    // A single GC pass. `reader` and all FANOUT `sd_leaf`s should be collected together: the
-    // aggregation rebalance frees the leaves' `upper` edge so they cascade in the same pass.
     let collected = tt2.backend().gc_for_testing(&tt2);
     tt2.backend().snapshot_and_evict_for_testing(&tt2);
     let after = tt2.backend().resident_persistent_task_count_for_testing();
 
-    // reader + FANOUT leaves = FANOUT + 1 tasks collected in one pass.
     assert_eq!(
         collected,
         FANOUT as usize + 1,
         "reader and all {FANOUT} sd_leaves should be collected in one pass"
     );
-    // The whole subtree left memory: the resident count dropped by exactly what was collected.
     assert_eq!(
         after,
         baseline - (FANOUT as usize + 1),
@@ -233,14 +221,12 @@ async fn gc_rebalances_aggregation_and_cascades_in_one_pass() {
     tt.stop_and_wait().await;
 }
 
-/// The **residual resurrection** race that soft-deletion exists to close. In the diamond, every
-/// `diamond_reader` `A` and its `diamond_target` `B` are direct children of `diamond_root`, and `A`
-/// holds a forward dependency on `B`. Collecting the root cascades a `Collect` for every `A` and
-/// `B` concurrently. When `A`'s teardown runs `CleanupOldEdges(A)`, its dependency arm opens `B`
-/// via `ctx.task(B, Data)` to scrub the reverse edge — so if `B` had already been removed from the
-/// map, `ctx.task` would restore it from disk into a zombie and memory/disk would diverge. Because
-/// a collected task stays resident until the tombstoning snapshot commits, `ctx.task` always finds
-/// a resident entry and the resident count drops to exactly baseline−collected.
+/// The **residual resurrection** race that soft-deletion exists to close. Collecting `diamond_root`
+/// cascades a concurrent `Collect` for every reader `A` and target `B`; `CleanupOldEdges(A)` opens
+/// `B` via `ctx.task(B, Data)` to scrub the reverse edge. If `B` had already been removed from the
+/// map, `ctx.task` would restore it from disk as a zombie and memory/disk would diverge. Because a
+/// collected task stays resident until the tombstoning snapshot commits, `ctx.task` always finds a
+/// resident entry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn gc_diamond_forward_dep_no_resurrection() {
     let (tt, _persistence_dir) = create_tt("gc_diamond_forward_dep_no_resurrection");
@@ -268,7 +254,6 @@ async fn gc_diamond_forward_dep_no_resurrection() {
 
     let baseline = tt2.backend().resident_persistent_task_count_for_testing();
 
-    // diamond_root + FANOUT readers (A) + FANOUT targets (B) = 2*FANOUT + 1 collected in one pass.
     let collected = tt2.backend().gc_for_testing(&tt2);
     tt2.backend().snapshot_and_evict_for_testing(&tt2);
     let after = tt2.backend().resident_persistent_task_count_for_testing();
@@ -278,8 +263,6 @@ async fn gc_diamond_forward_dep_no_resurrection() {
         2 * FANOUT as usize + 1,
         "diamond_root + {FANOUT} readers + {FANOUT} targets should all be collected in one pass"
     );
-    // No `diamond_target` was resurrected by a sibling reader's CleanupOldEdges scrub: the resident
-    // count dropped by exactly the collected subtree. A resurrected B leaves `after` above this.
     assert_eq!(
         after,
         baseline - (2 * FANOUT as usize + 1),
@@ -292,10 +275,7 @@ async fn gc_diamond_forward_dep_no_resurrection() {
 
 /// Resurrection-on-connect: a task marked `deleted` by GC but reconnected **before** the
 /// tombstoning snapshot must come back to life (marker cleared, made dirty, re-executed) rather
-/// than being tombstoned/hard-deleted. We run `gc_for_testing` (which marks the disconnected
-/// `reader` subtree `deleted` but leaves it resident, and does NOT snapshot), then reconnect the
-/// subtree and read it: it must recompute to the correct value, and a subsequent snapshot+evict
-/// must NOT have removed it.
+/// than being tombstoned/hard-deleted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn gc_resurrect_on_reconnect() {
     let (tt, _persistence_dir) = create_tt("gc_resurrect_on_reconnect");
@@ -330,8 +310,7 @@ async fn gc_resurrect_on_reconnect() {
     );
 
     // Reconnect the subtree (selector back to false) BEFORE any snapshot. Reading `reader` again
-    // connects it, which must resurrect it (and its leaves, as it re-reads them) and recompute the
-    // correct value — proving the deleted tasks came back rather than being read stale.
+    // connects it, which must resurrect it (and its leaves, as it re-reads them).
     let tt3 = tt.clone();
     let result = turbo_tasks::run_once(tt.clone(), async move {
         unmark_top_level_task_may_leak_eventually_consistent_state();
@@ -353,8 +332,7 @@ async fn gc_resurrect_on_reconnect() {
     .await;
     result.unwrap();
 
-    // A snapshot+evict now must NOT have tombstoned/hard-deleted the resurrected subtree: reading
-    // it once more still yields the correct value (it is live, not gone).
+    // A snapshot+evict now must NOT have tombstoned/hard-deleted the resurrected subtree.
     tt2.backend().snapshot_and_evict_for_testing(&tt2);
     let tt4 = tt.clone();
     let result = turbo_tasks::run_once(tt.clone(), async move {

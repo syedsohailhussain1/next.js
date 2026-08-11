@@ -34,10 +34,9 @@ fn enabled() -> bool {
 /// `gc_for_testing`, which does not consult the `TURBO_ENGINE_GC` env var, so nothing global needs
 /// setting.
 ///
-/// `num_workers: None` takes the production default (`available_parallelism`), which is what sizes
-/// the storage map's shard count. It must stay consistent with the runtime's `worker_threads` in
-/// [`gc`] — those two independently control shard count and GC drainer count, and setting them
-/// apart measures a configuration that never occurs in production. See the note there.
+/// `num_workers: None` takes the production default (`available_parallelism`), which sizes the
+/// storage map's shard count. It must stay consistent with the runtime's `worker_threads` in
+/// [`gc`] — see the note there.
 fn create_tt() -> (Arc<TurboTasks<TurboTasksBackend>>, tempfile::TempDir) {
     let parent = std::path::PathBuf::from(format!("{}/.cache", env!("CARGO_TARGET_TMPDIR")));
     std::fs::create_dir_all(&parent).unwrap();
@@ -158,7 +157,7 @@ pub fn gc(c: &mut Criterion) {
                 .worker_threads(std::thread::available_parallelism().map_or(4, |n| n.get()))
                 .build()
                 .unwrap();
-            // PerIteration: each collect consumes its garbage, so every iteration needs a freshly
+            // Each collect consumes its garbage, so every iteration needs a freshly
             // built+disconnected graph. Setup is not timed.
             b.iter_batched(
                 || setup_wide_garbage(&rt, width),

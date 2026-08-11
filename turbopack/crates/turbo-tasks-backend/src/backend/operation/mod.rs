@@ -84,15 +84,14 @@ pub trait ExecuteContext<'e>: Sized {
         task_id: TaskId,
         category: TaskDataCategory,
     ) -> Self::TaskGuardImpl;
-    /// Opens an **already-resident** task without restoring from disk and **without** inserting a
-    /// blank entry for a missing key (unlike [`Self::task`], which does both). Returns `None` if
-    /// the task is not resident.
+    /// Opens an **already-resident** task without restoring from disk and without inserting a blank
+    /// entry for a missing key. Returns `None` if the task is not resident.
     ///
     /// Because it performs no restore, the returned guard may only be used to touch **transient**
     /// fields (whose accessors don't gate on `check_access`); reading a Meta/Data field through it
-    /// would trip the `check_access` debug assertion. Used for pure in-session bookkeeping on a
-    /// live task — GC pin/unpin adjusting `transient_ref_count` — where a missing entry means
-    /// the caller referenced an already-collected task (a bug) rather than one to resurrect.
+    /// trips the `check_access` debug assertion. Used for in-session bookkeeping on a live task —
+    /// GC pin/unpin adjusting `transient_ref_count` — where a missing entry means the caller
+    /// referenced an already-collected task (a bug) rather than one to resurrect.
     fn resident_task(&mut self, task_id: TaskId) -> Option<Self::TaskGuardImpl>;
     /// Prepares (as in fetches from persistent storage) a list of tasks.
     /// The iterator should not have duplicates, as this would cause over-fetching.
@@ -251,11 +250,9 @@ pub struct ExecuteContextImpl<'e> {
     /// GC-only: ids whose persistent `parent_count` reached 0 during this context's operations.
     /// `None` for normal contexts, which makes the recording hook a no-op. See
     /// [`ExecuteContext::note_gc_parent_count_zeroed`].
-    // TODO: consider replacing this buffer with a callback so a newly-parentless child is handed
-    // to the collector (and can be spawned) immediately, rather than accumulated and drained
-    // after the whole `CleanupOldEdges` run finishes. Deferred: spawning mid-cleanup would
-    // start a child's collection while the parent still holds guards, so it needs a careful
-    // look at guard/lock ordering before it's worth the reduced latency.
+    // TODO: hand newly-parentless children to the collector via callback instead of buffering, for
+    // lower latency. Needs guard/lock-ordering review first: spawning mid-cleanup starts a child's
+    // collection while the parent still holds guards.
     gc_zeroed: Option<Vec<TaskId>>,
     /// GC-only: ids whose last aggregation edge (`upper` or `followers`) was removed during this
     /// context's operations. `None` for normal contexts. See
@@ -281,10 +278,8 @@ impl<'e> ExecuteContextImpl<'e> {
     /// Constructs a context that does NOT take an operation guard, for use by the garbage
     /// collector while it holds the coordinator's GC phase.
     ///
-    /// The GC phase excludes all concurrent operations and task execution, so taking an
-    /// operation guard here would in fact deadlock.
-    ///
-    /// Should only be used by the garbage collector implementation
+    /// The GC phase excludes all concurrent operations and task execution, so taking an operation
+    /// guard here would deadlock.
     pub(super) fn new_for_gc(
         backend: &'e TurboTasksBackend,
         turbo_tasks: &'e TurboTasks<TurboTasksBackend>,

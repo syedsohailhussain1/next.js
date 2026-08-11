@@ -14,8 +14,7 @@
 //!
 //! Snapshots and GC use two distinct request bits ([`SNAPSHOT_REQUESTED_BIT`] and
 //! [`GC_REQUESTED_BIT`]); operations drain/suspend for either. Snapshots and GC are mutually
-//! exclusive, and callers serialize them with the `snapshot_in_progress` mutex in `mod.rs` — the
-//! coordinator does not own that mutex, because callers interleave work between phases.
+//! exclusive; callers must serialize them (the `snapshot_in_progress` mutex in `mod.rs`).
 
 use std::sync::{
     Arc,
@@ -70,8 +69,7 @@ pub struct SnapshotCoordinator<O = AnyOperation> {
     /// Awaited by [`SnapshotCoordinator::begin_snapshot`] and [`SnapshotCoordinator::begin_gc`].
     operations_drained: Condvar,
     /// Notified by [`SnapshotPhase::drop`] and [`GcPhase::drop`]. Awaited by operations that hit a
-    /// suspend point or arrive while a snapshot or GC pass is in flight. Operations wait while
-    /// either `snapshot_requested` or `gc_requested` holds.
+    /// suspend point or arrive while a snapshot or GC pass is in flight.
     exclusion_completed: Condvar,
 }
 
@@ -105,8 +103,8 @@ impl<O> SnapshotCoordinator<O> {
         (self.in_progress_operations.load(Ordering::Acquire) & REQUEST_BITS) != 0
     }
 
-    /// Whether a GC phase is currently held (the `GC_REQUESTED_BIT` is set). Used by the GC-only
-    /// execute context to `debug_assert` it is running under the exclusion it requires.
+    /// Whether a GC phase is currently held. Used by the GC-only execute context to
+    /// `debug_assert` it is running under the exclusion it requires.
     pub fn gc_in_progress(&self) -> bool {
         (self.in_progress_operations.load(Ordering::Acquire) & GC_REQUESTED_BIT) != 0
     }
@@ -141,8 +139,6 @@ impl<O> SnapshotCoordinator<O> {
                 this.in_progress_operations.fetch_add(1, Ordering::AcqRel);
             }
         }
-        // Slow path: a snapshot or GC pass is in flight (or just requested). Back out the
-        // increment, wait for it to complete, then re-increment.
         wait_for_exclusion_to_complete(self);
         OperationGuard { coord: Some(self) }
     }
@@ -196,9 +192,9 @@ impl<O> SnapshotCoordinator<O> {
     }
 
     /// Shared core of [`begin_snapshot`](Self::begin_snapshot) and [`begin_gc`](Self::begin_gc):
-    /// asserts no snapshot or GC is already in flight, sets the requesting flag + request bit, and
-    /// blocks until every in-flight operation has drained or suspended. Returns the still-held
-    /// state lock so the caller can read `suspended_operations` (snapshot) before releasing it.
+    /// sets the request flag + bit and blocks until every in-flight operation has drained or
+    /// suspended. Returns the **still-held** state lock so the caller can read
+    /// `suspended_operations` before releasing it.
     ///
     /// `what` only labels the assertion messages and the drain span. The mutual-exclusion asserts
     /// are `assert!` rather than `debug_assert!` because silently ignoring a violation leads
@@ -233,10 +229,9 @@ impl<O> SnapshotCoordinator<O> {
             what.begin_fn()
         );
         if (active & !REQUEST_BITS) != 0 {
-            // Some operations are in flight. Wait for them to drain or suspend. The predicate is
-            // Acquire-loaded so we synchronize with the AcqRel decrement that woke us. This can
-            // block for a while under load (until every in-flight operation reaches a suspend point
-            // or finishes), so it gets its own span for latency attribution.
+            // The predicate is Acquire-loaded so we synchronize with the AcqRel decrement that woke
+            // us. This can block for a while under load (until every in-flight operation reaches a
+            // suspend point or finishes), so it gets its own span for latency attribution.
             let num_operations = active & !REQUEST_BITS;
             let _span = match what {
                 Exclusion::Snapshot => {
@@ -275,10 +270,9 @@ impl<O> SnapshotCoordinator<O> {
         }
     }
 
-    /// Begin a garbage-collection pass. Sets the GC bit, blocks until all in-flight operations have
-    /// drained or suspended, and returns a [`GcPhase`] guard that releases the bit on drop. While
-    /// the guard is held, no operation can be running, so the collector may mutate the task graph
-    /// without racing.
+    /// Begin a garbage-collection pass, returning a [`GcPhase`] guard that releases the exclusion
+    /// on drop. While the guard is held no operation can be running, so the collector may
+    /// mutate the task graph without racing.
     ///
     /// Concurrent callers panic (see [`begin_exclusion`](Self::begin_exclusion)).
     pub fn begin_gc(&self) -> GcPhase<'_, O> {
@@ -304,7 +298,7 @@ impl Exclusion {
         }
     }
 
-    /// Human label for the exclusion kind (used in the "bit already set" assert).
+    /// Human label for the exclusion kind, for assertion messages.
     fn label(self) -> &'static str {
         match self {
             Exclusion::Snapshot => "snapshot",
@@ -899,10 +893,9 @@ mod tests {
         });
 
         wait_for_snapshot_pending(&coord);
-        // The collector is waiting for our operation to drain. Suspending lets it proceed. The
-        // suspend closure IS invoked and the operation IS recorded even for a GC suspension, so
-        // that if the GC phase hands off to a snapshot (`into_snapshot`) the operation is
-        // carried into the replay log (a GC-only pass simply never reads the recorded set).
+        // The collector is waiting for our operation to drain; suspending lets it proceed. The
+        // suspend closure must still run — see `suspend_point`'s comment on why GC suspensions are
+        // recorded too.
         let recorded = Arc::new(AtomicUsize::new(0));
         let recorded_in_closure = recorded.clone();
         coord.suspend_point(move || {
@@ -925,7 +918,6 @@ mod tests {
     fn gc_during_snapshot_panics() {
         let coord = SnapshotCoordinator::<Op>::new();
         let _snap = coord.begin_snapshot();
-        // Callers must serialize GC vs snapshot; doing both at once is a protocol violation.
         let _gc = coord.begin_gc();
     }
 

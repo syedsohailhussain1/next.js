@@ -215,8 +215,7 @@ pub struct TurboTasksBackend {
     snapshot_in_progress: Mutex<()>,
 
     /// Whether the `parent_count` GC pass runs for this backend. Initialized from the
-    /// `TURBO_ENGINE_GC` env var, and forced off if the configuration would strand soft-deleted
-    /// tasks resident — see the constructor.
+    /// `TURBO_ENGINE_GC` env var; the constructor may force it off (see there).
     gc_enabled: bool,
 
     stopping: AtomicBool,
@@ -357,18 +356,18 @@ impl TurboTasksBackend {
         (had_new_data, counts)
     }
 
-    /// The number of persistent (non-transient) tasks resident in the map. Test-only hook: this is
-    /// the metric GC affects (transient roots like `run_once` tasks are never collected).
+    /// The number of persistent (non-transient) tasks resident in the map. Test-only hook; see
+    /// [`Storage::resident_persistent_task_count`] for why the metric excludes transient tasks.
     #[doc(hidden)]
     pub fn resident_persistent_task_count_for_testing(&self) -> usize {
         self.storage.resident_persistent_task_count()
     }
 
     /// Test-only GC invariant check: after a drained pass over a fully-resident graph, every
-    /// incoming aggregation edge (`upper`/`follower`) held by a surviving resident task must point
-    /// at a task that is still resident. A dangling edge to a non-resident (hence erased) task is
-    /// the erase-while-referenced bug. Returns `(referrer, dangling_target)` for the first
-    /// violation, or `None` if clean. See [`Storage::find_dangling_aggregation_edge`].
+    /// incoming aggregation edge (`upper`/`follower`) of a surviving resident task must point at a
+    /// still-resident task; a dangling edge is the erase-while-referenced bug. Returns
+    /// `(referrer, dangling_target)` for the first violation. See
+    /// [`Storage::find_dangling_aggregation_edge`] for the residency caveat.
     #[doc(hidden)]
     pub fn find_dangling_aggregation_edge_for_testing(&self) -> Option<(TaskId, TaskId)> {
         self.storage.find_dangling_aggregation_edge()
@@ -558,11 +557,10 @@ impl TurboTasksBackend {
         });
         let (mut task, mut reader_task) =
             lock_task_and_optional_reader(&mut ctx, task_id, need_reader_task);
-        // A GC-soft-deleted task must never be *read*: it was collected (edges scrubbed) and would
-        // return stale contents. Every re-entry funnels through `resurrect_deleted` at connect,
-        // which clears the flag and re-executes, so reaching a read with it still set means a
-        // resurrection path was missed. Asserted here rather than in `task`/`MustExist` because
-        // bookkeeping opens legitimately touch a deleted task mid-resurrection.
+        // A GC-soft-deleted task must never be *read*: it was collected (edges scrubbed). Every
+        // re-entry funnels through `resurrect_deleted` at connect, which clears the flag and
+        // re-executes. Asserted here rather than in `task`/`MustExist` because bookkeeping opens
+        // legitimately touch a deleted task mid-resurrection.
         debug_assert!(
             !task.deleted(),
             "read_task_output on a GC-deleted task {task_id} — a resurrection path was missed"
@@ -935,8 +933,7 @@ impl TurboTasksBackend {
         });
         let (mut task, reader_task) =
             lock_task_and_optional_reader(&mut ctx, task_id, need_reader_task);
-        // See the matching assert in `try_read_task_output`: a GC-deleted task must be resurrected
-        // (at connect) before any read; reaching a read with the flag still set is a missed path.
+        // See the matching assert in `try_read_task_output`.
         debug_assert!(
             !task.deleted(),
             "read_task_cell on a GC-deleted task {task_id} — a resurrection path was missed"
@@ -1066,9 +1063,8 @@ impl TurboTasksBackend {
         // a time. Held for the entire snapshot lifecycle.
         let _snapshot_in_progress = self.snapshot_in_progress.lock();
 
-        // Run the pass and hand its exclusion straight to the snapshot (`into_snapshot`, no
-        // operation can run in between), so the collected tasks' tombstones (derived from the
-        // `deleted` flag) ride this same commit.
+        // Hand the GC pass's exclusion straight to the snapshot (`into_snapshot`) so the collected
+        // tasks' tombstones (derived from the `deleted` flag) ride this same commit.
         let mut snapshot_phase = if self.gc_enabled {
             let gc_span = tracing::info_span!(
                 parent: parent_span.clone(),
@@ -1083,8 +1079,6 @@ impl TurboTasksBackend {
             gc_span.record("edges_deleted", stats.edges_deleted);
             gc_phase.into_snapshot()
         } else {
-            // `begin_snapshot` blocks until in-flight operations drain (spanned inside the
-            // coordinator).
             self.snapshot_coord.begin_snapshot()
         };
         let start = Instant::now();
@@ -1096,7 +1090,7 @@ impl TurboTasksBackend {
 
         // Enter snapshot mode, which atomically reads and resets the modified count. GC marks each
         // collected task modified, so a pass that collected anything makes `has_modifications`
-        // true and the scan below runs and emits the tombstones.
+        // true and the scan below emits the tombstones.
         // Checking after start_snapshot ensures no concurrent increments can race.
         let (snapshot_guard, has_modifications) = self.storage.start_snapshot();
 

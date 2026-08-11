@@ -60,8 +60,8 @@ fn leaf(generation: u32, index: u32) -> Vc<u32> {
     Vc::cell(generation.wrapping_mul(1000).wrapping_add(index))
 }
 
-/// An intermediate that reads one leaf — a shared-dependency layer so the disconnected garbage is a
-/// subtree (intermediate + leaf), exercising the cascade rather than single-node collection.
+/// A shared-dependency layer, so the disconnected garbage is a subtree (intermediate + leaf) and
+/// the test exercises the cascade rather than single-node collection.
 #[turbo_tasks::function]
 async fn intermediate(generation: u32, index: u32) -> Result<Vc<u32>> {
     Ok(Vc::cell(1 + *leaf(generation, index).await?))
@@ -69,9 +69,8 @@ async fn intermediate(generation: u32, index: u32) -> Result<Vc<u32>> {
 
 const WIDTH: u32 = 24;
 
-/// Reads WIDTH intermediates (each reading a leaf) for the current generation. Bumping the
-/// generation re-executes this and connects a fresh generation's worth of tasks, disconnecting the
-/// entire previous generation (2*WIDTH tasks) as garbage.
+/// Bumping the generation re-executes this and connects a fresh generation's worth of tasks,
+/// disconnecting the entire previous generation (2*WIDTH tasks) as garbage.
 #[turbo_tasks::function(operation, root)]
 async fn wide_root(generation: ResolvedVc<Generation>) -> Result<Vc<u32>> {
     let generation = *generation.await?.get();
@@ -82,11 +81,11 @@ async fn wide_root(generation: ResolvedVc<Generation>) -> Result<Vc<u32>> {
     Ok(Vc::cell(sum))
 }
 
-/// The pathology this whole effort targets: repeatedly swapping a wide set of common dependencies
-/// (as happens when a project is re-rooted or its dependencies churn) must NOT grow the resident
-/// task set monotonically. Each round bumps the generation (disconnecting the previous generation's
-/// 2*WIDTH tasks), then snapshots + GCs + evicts. The resident count must return to a flat baseline
-/// each round rather than climbing with the number of rounds.
+/// Repeatedly swapping a wide set of common dependencies (as happens when a project is re-rooted or
+/// its dependencies churn) must NOT grow the resident task set monotonically. Each round bumps the
+/// generation (disconnecting the previous generation's 2*WIDTH tasks), then snapshots + GCs +
+/// evicts. The resident count must return to a flat baseline each round rather than climbing with
+/// the number of rounds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gc_re_rooting_stays_flat() {
     let (tt, _persistence_dir) = create_tt("gc_re_rooting_stays_flat");
@@ -95,8 +94,7 @@ async fn gc_re_rooting_stays_flat() {
     const ROUNDS: u32 = 20;
 
     // Each round runs in its own `run_once` so the root's activeness is released before GC (a
-    // `run_once` root keeps everything it touched active until it returns). Returns the resident
-    // count measured after that round's snapshot + GC + evict.
+    // `run_once` root keeps everything it touched active until it returns).
     async fn round(tt: &Arc<TurboTasks<TurboTasksBackend>>, gen_value: u32) -> (usize, usize) {
         let tt_inner = tt.clone();
         turbo_tasks::run_once(tt.clone(), async move {
@@ -120,7 +118,7 @@ async fn gc_re_rooting_stays_flat() {
         // GC runs BEFORE eviction (matching the production background cycle: snapshot -> GC ->
         // evict), so the disconnected garbage is still resident when GC scans it. Running eviction
         // first would drop the garbage to disk-only where the in-memory GC can't collect or
-        // tombstone it. Return the number GC collected this round alongside the resident count.
+        // tombstone it.
         let collected = tt.backend().gc_for_testing(tt);
         tt.backend().snapshot_and_evict_for_testing(tt);
         // Measure the *persistent* resident count: GC only collects persistent tasks. Transient
@@ -136,9 +134,7 @@ async fn gc_re_rooting_stays_flat() {
     let (_, baseline) = round(&tt2, 0).await;
     println!("baseline persistent resident after gen 0: {baseline}");
 
-    // Churn: swap the whole dependency set many times. Track the max resident count and the total
-    // collected, so we assert both that memory stays flat AND that GC (not just eviction) is
-    // actually doing the collecting.
+    // Churn: swap the whole dependency set many times.
     let mut max_resident = baseline;
     let mut total_collected = 0usize;
     for gen_value in 1..=ROUNDS {
@@ -153,19 +149,17 @@ async fn gc_re_rooting_stays_flat() {
         "baseline={baseline} max_resident={max_resident} total_collected={total_collected} \
          no_gc_growth_would_be={no_gc_growth}"
     );
-    // Flat-baseline assertion on the PERSISTENT resident set: without GC it would climb by ~2*WIDTH
-    // per round (each generation's intermediates + leaves persisted forever). With GC each
-    // generation's garbage subtree is collected, so the persistent set stays within a small
-    // constant of the baseline regardless of the number of rounds.
+    // Without GC the persistent resident set would climb by ~2*WIDTH per round (each generation's
+    // intermediates + leaves persisted forever), so a bound within a small constant of the baseline
+    // is only satisfiable if each generation's garbage subtree is actually collected.
     assert!(
         max_resident <= baseline + 2 * WIDTH as usize,
         "persistent resident set grew too much across re-rooting (max={max_resident}, \
          baseline={baseline}); GC is not returning to a flat baseline"
     );
-    // GC must be doing the work: each round disconnects a full generation (2*WIDTH tasks), so over
-    // ROUNDS rounds GC should have collected on the order of 2*WIDTH*ROUNDS tasks. Assert it
-    // collected at least most of that (allowing slack for tasks that settle across passes), proving
-    // the flat baseline is due to GC collecting garbage — not merely eviction hiding it on disk.
+    // Assert GC collected at least half of a full generation per round (slack for tasks that settle
+    // across passes), proving the flat baseline comes from GC collecting garbage — not merely from
+    // eviction hiding it on disk.
     let expected_min_collected = (2 * WIDTH as usize) * (ROUNDS as usize) / 2;
     assert!(
         total_collected >= expected_min_collected,
@@ -210,9 +204,8 @@ async fn huge_root(generation: ResolvedVc<Generation>) -> Result<Vc<u32>> {
 }
 
 /// Exercises the *per-task* fan-out of the parallel collector: a single collected task has
-/// thousands of children and forward dependencies, all torn down in one `Collect` job while
-/// sibling collects run on other workers. Collecting the disconnected generation's `huge_root`
-/// (≈FANOUT children) + its FANOUT leaves must fully reclaim the subtree, and the graph must still
+/// thousands of children and forward dependencies, all torn down in one `Collect` job while sibling
+/// collects run on other workers. The subtree must be fully reclaimed and the graph must still
 /// recompute afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gc_collects_wide_fanout_task() {
@@ -230,7 +223,6 @@ async fn gc_collects_wide_fanout_task() {
         let output = huge_root(generation_vc);
         output.read_strongly_consistent().await?;
 
-        // Disconnect the whole generation-0 fan-out in one shot.
         generation.set(1);
         output.read_strongly_consistent().await?;
         anyhow::Ok(())
@@ -238,8 +230,7 @@ async fn gc_collects_wide_fanout_task() {
     .await;
     result.unwrap();
 
-    // Baseline after building + reading generation 1 (once, to settle), then collect the
-    // disconnected generation-0 subtree.
+    // Baseline after building + reading generation 1 once, to settle.
     let baseline = tt2.backend().resident_persistent_task_count_for_testing();
     let collected = tt2.backend().gc_for_testing(&tt2);
     tt2.backend().snapshot_and_evict_for_testing(&tt2);
@@ -248,10 +239,9 @@ async fn gc_collects_wide_fanout_task() {
     println!(
         "wide-fanout: baseline={baseline} collected={collected} after={after} (fanout={FANOUT})"
     );
-    // Collecting one wide-fanout generation tears down ~FANOUT+1 tasks (huge_root + its leaves)
-    // spread across worker threads via the chunked jobs. Assert the pass collected the bulk of a
-    // full generation (allowing slack for tasks that settle across passes), proving the per-task
-    // fan-out actually reclaims the whole subtree rather than pinning/starving.
+    // The bound is loose (half a generation) to allow for tasks that settle across passes; the
+    // point is that the chunked per-task fan-out reclaims the bulk of the subtree rather than
+    // starving.
     assert!(
         collected >= (FANOUT as usize) / 2,
         "wide-fanout GC collected too little ({collected}); expected >= {} — per-task fan-out is \

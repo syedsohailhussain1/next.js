@@ -9,6 +9,7 @@ use std::{
     },
 };
 
+use crossbeam_utils::CachePadded;
 use dashmap::SharedValue;
 use hashbrown::raw::RawIntoIter;
 use rustc_hash::FxHashSet;
@@ -163,7 +164,12 @@ pub struct Storage {
     /// that  `shard_modified_counts.len()==map.shards().len()`
     ///
     /// Should only be modified while holding the corresponding dashmap shard lock.
-    shard_modified_counts: Box<[AtomicU64]>,
+    ///
+    /// `CachePadded` because these are incremented from every worker at once and, unpadded, eight
+    /// counters share a cache line: threads touching *different* shards would still ping-pong the
+    /// same line. The shard lock serializes same-shard access but does nothing for neighbours.
+    /// Costs one cache line per shard (~256KiB at the default 4096 shards).
+    shard_modified_counts: Box<[CachePadded<AtomicU64>]>,
     /// Stores snapshots of task state for tasks accessed during snapshot mode.
     /// - `Some(snapshot)`: Task was modified before snapshot mode and accessed again during it.
     ///   Contains a copy of the pre-snapshot state that needs to be persisted.
@@ -220,7 +226,7 @@ impl Storage {
             shard_amount,
         );
         let shard_modified_counts = (0..shard_amount)
-            .map(|_| AtomicU64::new(0))
+            .map(|_| CachePadded::new(AtomicU64::new(0)))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {

@@ -4,10 +4,8 @@ import {
 } from '../app-render/work-async-storage.external'
 import type { OpaqueFallbackRouteParams } from './fallback-params'
 import type { VaryParamsAccumulator } from '../app-render/vary-params'
-import {
-  createVaryingParams,
-  getMetadataVaryParamsAccumulator,
-} from '../app-render/vary-params'
+import { createVaryingParams } from '../app-render/vary-params'
+import { getMetadataVaryParamsAccumulator } from '../app-render/segment-store'
 
 import { ReflectAdapter } from '../web/spec-extension/adapters/reflect'
 import {

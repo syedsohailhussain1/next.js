@@ -3,10 +3,8 @@ import {
   type WorkStore,
 } from '../app-render/work-async-storage.external'
 import type { VaryParamsAccumulator } from '../app-render/vary-params'
-import {
-  createVaryingSearchParams,
-  getMetadataVaryParamsAccumulator,
-} from '../app-render/vary-params'
+import { createVaryingSearchParams } from '../app-render/vary-params'
+import { getMetadataVaryParamsAccumulator } from '../app-render/segment-store'
 
 import { ReflectAdapter } from '../web/spec-extension/adapters/reflect'
 import {

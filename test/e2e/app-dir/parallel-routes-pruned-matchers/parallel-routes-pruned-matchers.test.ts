@@ -1,29 +1,80 @@
 import { nextTestSetup } from 'e2e-utils'
+import { createRouterAct } from 'router-act'
+import cheerio from 'cheerio'
+
+const prunedRoutes: Array<[path: string, layoutId: string]> = [
+  ['/named-catchall/anything', 'named-catchall-layout'],
+  ['/children-catchall/foo', 'children-catchall-layout'],
+  ['/children-catchall/bar', 'children-catchall-layout'],
+  ['/optional-children-catchall', 'optional-children-catchall-layout'],
+  ['/optional-children-catchall/anything', 'optional-children-catchall-layout'],
+  ['/split-matcher/anything', 'split-matcher-layout'],
+  ['/nested-parallel/anything', 'nested-parallel-layout'],
+  ['/grouped/anything', 'grouped-layout'],
+]
+
+const namedOnlyParallelRouteKeys = `(() => {
+  const root = window.history.state?.__PRIVATE_NEXTJS_INTERNALS_TREE?.tree
+
+  function findSegment(node) {
+    if (!node) return null
+    const segment = Array.isArray(node[0]) ? node[0][1] : node[0]
+    if (segment === 'named-only-catchalls') {
+      return Object.keys(node[1]).sort()
+    }
+    for (const child of Object.values(node[1])) {
+      const result = findSegment(child)
+      if (result) return result
+    }
+    return null
+  }
+
+  return findSegment(root)
+})()`
 
 describe('parallel-routes-pruned-matchers', () => {
   const { next, isNextStart } = nextTestSetup({
     files: __dirname,
   })
 
-  it.each([
-    ['/named-catchall/anything', 'named-catchall-layout'],
-    ['/children-catchall/foo', 'children-catchall-layout'],
-    ['/children-catchall/bar', 'children-catchall-layout'],
-    ['/optional-children-catchall', 'optional-children-catchall-layout'],
-    [
-      '/optional-children-catchall/anything',
-      'optional-children-catchall-layout',
-    ],
-    ['/split-matcher/anything', 'split-matcher-layout'],
-    ['/nested-parallel/anything', 'nested-parallel-layout'],
-    ['/grouped/anything', 'grouped-layout'],
-  ])(
+  it.each(prunedRoutes)(
     'omits the permanently-not-found matcher for %s',
     async (path, layoutId) => {
-      const $ = await next.render$(path)
+      const response = await next.fetch(path)
+      const $ = cheerio.load(await response.text())
 
+      expect(response.status).toBe(404)
       expect($.root().text()).toContain('root not found')
       expect($(`#${layoutId}`).length).toBe(0)
+    }
+  )
+
+  it.each(prunedRoutes)(
+    'renders the same 404 after client navigation to %s',
+    async (path, layoutId) => {
+      let act: ReturnType<typeof createRouterAct>
+      const responseStatuses: number[] = []
+      const browser = await next.browser('/', {
+        beforePageLoad(page) {
+          page.on('response', (response) => {
+            if (new URL(response.url()).pathname === path) {
+              responseStatuses.push(response.status())
+            }
+          })
+          act = createRouterAct(page, { allowErrorStatusCodes: [404] })
+        },
+      })
+
+      await act!(async () => {
+        await browser.elementByCss(`button[data-router-push="${path}"]`).click()
+      })
+
+      await browser.waitForElementByCss('#root-not-found')
+      expect(await browser.elementById('root-not-found').text()).toBe(
+        'root not found'
+      )
+      expect(await browser.hasElementByCss(`#${layoutId}`)).toBe(false)
+      expect(responseStatuses).toContain(404)
     }
   )
 
@@ -35,10 +86,38 @@ describe('parallel-routes-pruned-matchers', () => {
   })
 
   it('keeps a broad matcher composed entirely from named slots', async () => {
-    const $ = await next.render$('/named-only-catchalls/anything')
+    const browser = await next.browser('/named-only-catchalls/anything')
 
-    expect($('#named-only-left-catchall').text()).toBe('left catch-all')
-    expect($('#named-only-right-catchall').text()).toBe('right catch-all')
+    expect(await browser.elementById('named-only-left-catchall').text()).toBe(
+      'left catch-all'
+    )
+    expect(await browser.elementById('named-only-right-catchall').text()).toBe(
+      'right catch-all'
+    )
+    expect(await browser.eval(namedOnlyParallelRouteKeys)).toEqual([
+      'left',
+      'right',
+    ])
+  })
+
+  it('keeps the named-only tree without children after client navigation', async () => {
+    let act: ReturnType<typeof createRouterAct>
+    const path = '/named-only-catchalls/anything'
+    const browser = await next.browser('/', {
+      beforePageLoad(page) {
+        act = createRouterAct(page)
+      },
+    })
+
+    await act!(async () => {
+      await browser.elementByCss(`button[data-router-push="${path}"]`).click()
+    })
+
+    await browser.waitForElementByCss('#named-only-catchalls-layout')
+    expect(await browser.eval(namedOnlyParallelRouteKeys)).toEqual([
+      'left',
+      'right',
+    ])
   })
 
   it('keeps a named catch-all when children has an explicit default', async () => {

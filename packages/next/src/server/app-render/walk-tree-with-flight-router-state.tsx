@@ -22,6 +22,10 @@ import type { AppRenderContext } from './app-render'
 import { hasLoadingComponentInTree } from './has-loading-component-in-tree'
 import { addSearchParamsIfPageSegment } from '../../shared/lib/segment'
 import { createComponentTree } from './create-component-tree'
+import {
+  isRetainedParallelRoute,
+  omitRetainedParallelRoutesFromTransportTree,
+} from './is-retained-parallel-route'
 
 /**
  * The result of rendering a navigation (or refresh/action) response: the
@@ -241,6 +245,7 @@ export async function walkTreeWithFlightRouterState({
         MetadataOutlet,
         isPrerendering: false,
         hintTree,
+        omitRetainedParallelRoutes: true,
       }
     )
 
@@ -282,13 +287,17 @@ export async function walkTreeWithFlightRouterState({
 
   for (const parallelRouteKey of parallelRoutesKeys) {
     const parallelRoute = parallelRoutes[parallelRouteKey]
+    const activeParallelRoute = flightRouterState?.[1][parallelRouteKey]
+
+    if (isRetainedParallelRoute(parallelRoute)) {
+      continue
+    }
 
     const subtreeResult = await walkTreeWithFlightRouterState({
       ctx,
       loaderTreeToFilter: parallelRoute,
       parentParams: currentParams,
-      flightRouterState:
-        flightRouterState && flightRouterState[1][parallelRouteKey],
+      flightRouterState: activeParallelRoute,
       parentIsInsideSharedLayout: isInsideSharedLayout,
       rscHead,
       injectedCSS: injectedCSSWithCurrentLayout,
@@ -380,7 +389,9 @@ export async function createFullTreeForNavigation({
     MetadataOutlet,
     isPrerendering: false,
     hintTree: hintTreeForInitialRender,
+    omitRetainedParallelRoutes: false,
   })
+  omitRetainedParallelRoutesFromTransportTree(loaderTree, tree)
 
   return {
     tree,

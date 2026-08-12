@@ -42,6 +42,8 @@ import {
   type FullTransportNode,
   transportSegmentToSegment,
 } from '../../shared/lib/rsc-transport'
+import type { LoaderTree } from '../lib/app-dir-module'
+import { omitRetainedParallelRoutesFromTransportTree } from './is-retained-parallel-route'
 
 // Contains metadata about the route tree. The client must fetch this before
 // it can fetch any actual segment data.
@@ -242,6 +244,80 @@ function onSegmentPrerenderError(error: unknown) {
       Phase.SegmentCollection
     )
   }
+}
+
+/**
+ * The initial Flight payload is also used to render HTML, so it must contain
+ * concrete null fallbacks for retained slots. A cached navigation response
+ * has different semantics: those branches are omitted so the client keeps
+ * its active slot. Decode the completed prerender and re-encode that partial
+ * representation without re-running user components.
+ */
+export async function createNavigationFlightData(
+  fullPageDataBuffer: Buffer,
+  loaderTree: LoaderTree,
+  clientModules: ManifestNode,
+  serverConsumerManifest: any
+): Promise<Buffer> {
+  // Warm client-reference modules before the abortable decode below. Without
+  // this pass, module loading can outlive the render tasks used to distinguish
+  // resolved data from intentionally pending dynamic holes.
+  try {
+    await createFromReadableStream(streamFromBuffer(fullPageDataBuffer), {
+      findSourceMapURL,
+      serverConsumerManifest,
+    })
+    await waitAtLeastOneReactRenderTask()
+  } catch {}
+
+  const payload: InitialRSCPayload = await createFromReadableStream(
+    createUnclosingPrefetchStream(streamFromBuffer(fullPageDataBuffer)),
+    {
+      findSourceMapURL,
+      serverConsumerManifest,
+    }
+  )
+  omitRetainedParallelRoutesFromTransportTree(loaderTree, payload.t.t)
+
+  const abortController = new AbortController()
+  const stream: ReadableStream<Uint8Array> = renderToReadableStream(
+    payload,
+    clientModules,
+    {
+      filterStackFrame,
+      signal: abortController.signal,
+      onError(error: unknown) {
+        if (abortController.signal.aborted) {
+          return undefined
+        }
+        return onSegmentPrerenderError(error)
+      },
+    }
+  )
+
+  const reader = stream.getReader()
+  const chunksPromise = new Promise<Uint8Array[]>(async (resolve) => {
+    const chunks: Uint8Array[] = []
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) {
+        break
+      }
+      if (!abortController.signal.aborted) {
+        chunks.push(value)
+      }
+    }
+    resolve(chunks)
+  })
+
+  // All source bytes are already available. Give decoded references the same
+  // multi-task flush window used by segment prefetches, then halt any
+  // intentionally pending dynamic holes.
+  await waitAtLeastOneReactRenderTask()
+  await waitAtLeastOneReactRenderTask()
+  await waitAtLeastOneReactRenderTask()
+  abortController.abort()
+  return Buffer.concat(await chunksPromise)
 }
 
 export async function collectSegmentData(

@@ -67,6 +67,7 @@ export { taintObjectReference } from './rsc/taint'
 export {
   collectSegmentData,
   collectPrefetchHints,
+  createNavigationFlightData,
 } from './collect-segment-data'
 
 export const InstantValidation = () => {

@@ -151,6 +151,10 @@ import {
   createFullTreeForNavigation,
 } from './walk-tree-with-flight-router-state'
 import { createFullComponentTree, getRootParams } from './create-component-tree'
+import {
+  hasRetainedParallelRoute,
+  omitRetainedParallelRoutesFromTransportTree,
+} from './is-retained-parallel-route'
 import { getAssetQueryString } from './get-asset-query-string'
 import {
   getClientReferenceManifest,
@@ -2179,6 +2183,7 @@ async function getRSCPayload(
     MetadataOutlet,
     isPrerendering,
     hintTree: hints,
+    omitRetainedParallelRoutes: false,
   })
 
   // When the `vary` response header is present with `Next-URL`, that means there's a chance
@@ -2368,6 +2373,9 @@ async function getErrorRSCPayload(
     getDynamicParamFromSegment,
     query
   )
+  if (ctx.parsedRequestHeaders.isRSCRequest) {
+    omitRetainedParallelRoutesFromTransportTree(tree, initialTree)
+  }
   // Attach the error shell as the root's render output. Vary params are not
   // tracked for error pages.
   initialTree.d = { r: errorShell, p: false, v: null }
@@ -9259,27 +9267,22 @@ async function prerenderToStream(
       reactServerPrerenderResultIsDynamic = resultIsPartial
       reactServerPrerenderStore = finalServerPrerenderStore
 
-      metadata.flightData = Buffer.concat(
-        cachedNavigations
-          ? prependIsPartialByteToChunks(
-              reactServerResult.asChunks(),
-              resultIsPartial
-            )
-          : reactServerResult.asChunks()
-      )
-
-      // collectSegmentData needs the raw flight data without the marker byte.
-      const flightData = cachedNavigations
-        ? metadata.flightData.subarray(1)
-        : metadata.flightData
-
-      await collectSegmentData(
-        flightData,
+      const fullFlightData = Buffer.concat(reactServerResult.asChunks())
+      const navigationFlightData = await collectSegmentData(
+        fullFlightData,
         finalServerPrerenderStore,
         ComponentMod,
         renderOpts,
         ctx.pagePath,
         metadata
+      )
+      metadata.flightData = Buffer.concat(
+        cachedNavigations
+          ? prependIsPartialByteToChunks(
+              [navigationFlightData],
+              resultIsPartial
+            )
+          : [navigationFlightData]
       )
 
       const clientDynamicTracking = createDynamicTrackingState(
@@ -9576,8 +9579,7 @@ async function prerenderToStream(
       )
 
       const flightData = await streamToBuffer(reactServerResult.asStream())
-      metadata.flightData = flightData
-      await collectSegmentData(
+      metadata.flightData = await collectSegmentData(
         flightData,
         prerenderLegacyStore,
         ComponentMod,
@@ -10122,8 +10124,7 @@ async function prerenderToStream(
       const flightData = await streamToBuffer(
         reactServerPrerenderResult.asStream()
       )
-      metadata.flightData = flightData
-      await collectSegmentData(
+      metadata.flightData = await collectSegmentData(
         flightData,
         prerenderLegacyStore,
         ComponentMod,
@@ -10371,7 +10372,7 @@ async function collectSegmentData(
   renderOpts: RenderOpts,
   pagePath: string,
   metadata: AppPageRenderResultMetadata
-): Promise<void> {
+): Promise<Buffer> {
   // Per-segment prefetch data
   //
   // All of the segments for a page are generated simultaneously, including
@@ -10399,6 +10400,16 @@ async function collectSegmentData(
     moduleMap: isEdgeRuntime ? edgeRscModuleMapping : rscModuleMapping,
     serverModuleMap: getServerModuleMap(),
   }
+
+  const loaderTree = ComponentMod.routeModule.userland.loaderTree
+  const navigationFlightData = hasRetainedParallelRoute(loaderTree)
+    ? await ComponentMod.createNavigationFlightData(
+        fullPageDataBuffer,
+        loaderTree,
+        clientModules,
+        serverConsumerManifest
+      )
+    : fullPageDataBuffer
 
   const selectStaleTime = createSelectStaleTime(renderOpts.experimental)
   const staleTime = selectStaleTime(prerenderStore.stale)
@@ -10442,7 +10453,7 @@ async function collectSegmentData(
       // measure, but the static-prefetch hint still rides the manifest —
       // collectPrefetchHints then only builds the tree shape carrying it.
       hints = await ComponentMod.collectPrefetchHints(
-        fullPageDataBuffer,
+        navigationFlightData,
         staleTime,
         clientModules,
         serverConsumerManifest,
@@ -10518,7 +10529,7 @@ async function collectSegmentData(
   // are already embedded in the FlightRouterState, so this is null.
   metadata.segmentData = await ComponentMod.collectSegmentData(
     renderOpts.cacheComponents,
-    fullPageDataBuffer,
+    navigationFlightData,
     staleTime,
     clientModules,
     serverConsumerManifest,
@@ -10526,6 +10537,7 @@ async function collectSegmentData(
     hints,
     isUpgradeableISRFallback
   )
+  return navigationFlightData
 }
 
 function isBypassingCachesInDev(

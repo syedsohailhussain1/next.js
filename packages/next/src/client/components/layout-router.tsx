@@ -512,7 +512,38 @@ function LoadingBoundary({
  * OuterLayoutRouter handles the current segment as well as <Offscreen> rendering of other segments.
  * It can be rendered next to each other with a different `parallelRouterKey`, allowing for Parallel routes.
  */
-export default function OuterLayoutRouter({
+type OuterLayoutRouterProps = {
+  parallelRouterKey: string
+  renderNullWhenMissing?: boolean
+  error: ErrorComponent | undefined
+  errorStyles: React.ReactNode | undefined
+  errorScripts: React.ReactNode | undefined
+  templateStyles: React.ReactNode | undefined
+  templateScripts: React.ReactNode | undefined
+  template: React.ReactNode
+  notFound: React.ReactNode | undefined
+  forbidden: React.ReactNode | undefined
+  unauthorized: React.ReactNode | undefined
+  segmentViewBoundaries?: React.ReactNode
+}
+
+export default function OuterLayoutRouter(props: OuterLayoutRouterProps) {
+  const context = useContext(LayoutRouterContext)
+  if (!context) {
+    throw new Error('invariant expected layout router to be mounted')
+  }
+
+  if (
+    props.renderNullWhenMissing &&
+    context.parentTree[1][props.parallelRouterKey] === undefined
+  ) {
+    return null
+  }
+
+  return <OuterLayoutRouterInner {...props} context={context} />
+}
+
+function OuterLayoutRouterInner({
   parallelRouterKey,
   error,
   errorStyles,
@@ -524,24 +555,10 @@ export default function OuterLayoutRouter({
   forbidden,
   unauthorized,
   segmentViewBoundaries,
-}: {
-  parallelRouterKey: string
-  error: ErrorComponent | undefined
-  errorStyles: React.ReactNode | undefined
-  errorScripts: React.ReactNode | undefined
-  templateStyles: React.ReactNode | undefined
-  templateScripts: React.ReactNode | undefined
-  template: React.ReactNode
-  notFound: React.ReactNode | undefined
-  forbidden: React.ReactNode | undefined
-  unauthorized: React.ReactNode | undefined
-  segmentViewBoundaries?: React.ReactNode
+  context,
+}: OuterLayoutRouterProps & {
+  context: NonNullable<React.ContextType<typeof LayoutRouterContext>>
 }) {
-  const context = useContext(LayoutRouterContext)
-  if (!context) {
-    throw new Error('invariant expected layout router to be mounted')
-  }
-
   const {
     parentTree,
     parentCacheNode,
@@ -576,7 +593,14 @@ export default function OuterLayoutRouter({
   // params on the server.)
   const activeTree = parentTree[1][parallelRouterKey]
   const maybeParentSlots = parentCacheNode.slots
-  if (activeTree === undefined || maybeParentSlots === null) {
+  if (activeTree === undefined) {
+    // Could not find a matching segment. The client tree is inconsistent with
+    // the server tree. Suspend indefinitely; the router will have already
+    // detected the inconsistency when handling the server response, and
+    // triggered a refresh of the page to recover.
+    use(unresolvedThenable) as never
+  }
+  if (maybeParentSlots === null) {
     // Could not find a matching segment. The client tree is inconsistent with
     // the server tree. Suspend indefinitely; the router will have already
     // detected the inconsistency when handling the server response, and

@@ -1,4 +1,5 @@
 import type { LoaderTree } from '../lib/app-dir-module'
+import { isRetainedParallelRoute } from './is-retained-parallel-route'
 import {
   PrefetchHint,
   propagateSubtreeBits,
@@ -179,7 +180,8 @@ async function createTransportTreeFromLoaderTreeImpl(
   partialPrefetching: boolean | 'unstable_eager' | undefined,
   getDynamicParamFromSegment: GetDynamicParamFromSegment,
   searchParams: any,
-  didFindRootLayout: boolean
+  didFindRootLayout: boolean,
+  omitRetainedParallelRoutes: boolean
 ): Promise<PartialTransportNode> {
   const [segment, parallelRoutes, { layout }] = loaderTree
   const dynamicParam = getDynamicParamFromSegment(loaderTree)
@@ -201,12 +203,17 @@ async function createTransportTreeFromLoaderTreeImpl(
 
   let children: Map<string, PartialTransportNode> | undefined
   for (const parallelRouteKey in parallelRoutes) {
+    const parallelRoute = parallelRoutes[parallelRouteKey]
+    if (omitRetainedParallelRoutes && isRetainedParallelRoute(parallelRoute)) {
+      continue
+    }
+
     // Look up the child hint node by parallel route key, traversing the
     // hint tree in parallel with the loader tree.
     const childHintNode = hintTree?.slots?.[parallelRouteKey] ?? null
 
     const child = await createTransportTreeFromLoaderTreeImpl(
-      parallelRoutes[parallelRouteKey],
+      parallelRoute,
       emitSkippedData,
       childHintNode,
       prefetchInliningEnabled,
@@ -214,7 +221,8 @@ async function createTransportTreeFromLoaderTreeImpl(
       partialPrefetching,
       getDynamicParamFromSegment,
       searchParams,
-      didFindRootLayout
+      didFindRootLayout,
+      omitRetainedParallelRoutes
     )
     // Propagate subtree flags from children
     if (child.h !== undefined) {
@@ -271,7 +279,8 @@ export async function createTransportTreeFromLoaderTree(
     partialPrefetching,
     getDynamicParamFromSegment,
     searchParams,
-    didFindRootLayout
+    didFindRootLayout,
+    true
   )
 }
 
@@ -301,6 +310,7 @@ export async function createFullTransportTreeFromLoaderTree(
     partialPrefetching,
     getDynamicParamFromSegment,
     searchParams,
+    false,
     false
   ) as Promise<FullTransportNode>
 }
@@ -332,6 +342,7 @@ export async function createRouteTreePrefetch(
     partialPrefetching,
     getDynamicParamFromSegment,
     searchParams,
-    didFindRootLayout
+    didFindRootLayout,
+    true
   )
 }

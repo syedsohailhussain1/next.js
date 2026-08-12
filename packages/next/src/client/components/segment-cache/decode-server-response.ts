@@ -236,12 +236,13 @@ export function createRouteTreeNode<TData>(
  *
  * - Nodes with rendered output — and nodes with no data at all, which are
  *   server-sent structure whose output the client fetches lazily — are
- *   authoritative: their identity, hints, and subtree come entirely from
- *   the response.
+ *   authoritative for their identity, hints, and mentioned slots.
  * - Skipped nodes (data with a null rsc) sit on the path from the root down
  *   to the rendered subtrees. The client is expected to already have them,
- *   so their refresh state and hints are inherited from the base tree, and
- *   any slot the response doesn't mention is reused from the base as-is.
+ *   so their refresh state and hints are inherited from the base tree.
+ * - At any node whose segment still matches the base, a slot the response
+ *   doesn't mention is reused from the base as-is. If the segment changed,
+ *   the response is authoritative about which slots exist at the new owner.
  *
  * TODO: The base is a FlightRouterState only because that's the
  * representation the client router currently renders from (the router
@@ -287,6 +288,13 @@ function decodeTransportNode(
   const inheritedBase = inheritsFromBase ? base : undefined
 
   const originalSegment = transportSegmentToSegment(node.s)
+  const baseSegmentMatches =
+    base !== undefined &&
+    ((typeof originalSegment === 'string' &&
+      typeof base[0] === 'string' &&
+      originalSegment.startsWith(PAGE_SEGMENT_KEY) &&
+      base[0].startsWith(PAGE_SEGMENT_KEY)) ||
+      matchSegment(base[0], originalSegment))
 
   if (compareBase !== undefined && !acc.treeDivergedFromBase) {
     // Every transport node echoes the segment's identity, even "skipped"
@@ -354,7 +362,11 @@ function decodeTransportNode(
   let slots: Map<string, RouteTree<RSCSegmentData | null>> | null = null
   const transportChildren = node.c
   const baseChildren =
-    inheritedBase !== undefined ? inheritedBase[1] : undefined
+    inheritedBase !== undefined
+      ? inheritedBase[1]
+      : baseSegmentMatches
+        ? base[1]
+        : undefined
   if (transportChildren !== undefined) {
     for (const [parallelRouteKey, childNode] of transportChildren) {
       const childBase =

@@ -58,6 +58,7 @@ import {
   getConventionPathByType,
   isNextjsBuiltinFilePath,
 } from './segment-explorer-path'
+import { isRetainedParallelRoute } from './is-retained-parallel-route'
 
 type CreateComponentTreeProps = {
   loaderTree: LoaderTree
@@ -75,6 +76,7 @@ type CreateComponentTreeProps = {
   MetadataOutlet: ComponentType
   isPrerendering: boolean
   hintTree: PrefetchHints | null
+  omitRetainedParallelRoutes: boolean
 }
 
 /**
@@ -141,6 +143,7 @@ async function createComponentTreeInternal(
     MetadataOutlet,
     isPrerendering,
     hintTree,
+    omitRetainedParallelRoutes,
   }: {
     loaderTree: LoaderTree
     parentParams: Params
@@ -156,6 +159,7 @@ async function createComponentTreeInternal(
     MetadataOutlet: ComponentType | null
     isPrerendering: boolean
     hintTree: PrefetchHints | null
+    omitRetainedParallelRoutes: boolean
   },
   isRoot: boolean,
   workUnitStore: WorkUnitStore
@@ -535,9 +539,10 @@ async function createComponentTreeInternal(
     Object.keys(parallelRoutes).map(
       async (
         parallelRouteKey
-      ): Promise<[string, React.ReactNode, PartialTransportNode]> => {
+      ): Promise<[string, React.ReactNode, PartialTransportNode | null]> => {
         const isChildrenRouteKey = parallelRouteKey === 'children'
         const parallelRoute = parallelRoutes[parallelRouteKey]
+        const isRetainedRoute = isRetainedParallelRoute(parallelRoute)
         const childHintTree = hintTree?.slots?.[parallelRouteKey] ?? null
 
         const notFoundComponent = isChildrenRouteKey
@@ -555,9 +560,13 @@ async function createComponentTreeInternal(
         // if we're prefetching and that there's a Loading component, we bail out
         // otherwise we keep rendering for the prefetch.
         // We also want to bail out if there's no Loading component in the tree.
-        let childNode: PartialTransportNode
+        let childNode: PartialTransportNode | null = null
 
-        if (
+        if (omitRetainedParallelRoutes && isRetainedRoute) {
+          // This is a partial-response instruction. Keep the LayoutRouter
+          // outlet in the rendered layout, but omit the branch from the route
+          // tree so the client retains the active state for this slot.
+        } else if (
           // Before PPR, the way instant navigations work in Next.js is we
           // prefetch everything up to the first route segment that defines a
           // loading.tsx boundary. (We do the same if there's no loading
@@ -635,6 +644,7 @@ async function createComponentTreeInternal(
               MetadataOutlet: isChildrenRouteKey ? MetadataOutlet : null,
               isPrerendering,
               hintTree: childHintTree,
+              omitRetainedParallelRoutes,
             },
             false,
             workUnitStore
@@ -703,6 +713,7 @@ async function createComponentTreeInternal(
           parallelRouteKey,
           createElement(LayoutRouter, {
             parallelRouterKey: parallelRouteKey,
+            renderNullWhenMissing: isRetainedRoute,
             error: ErrorComponent,
             errorStyles: wrappedErrorStyles,
             errorScripts: errorScripts,
@@ -749,12 +760,14 @@ async function createComponentTreeInternal(
   for (const parallelRoute of parallelRouteMap) {
     const [parallelRouteKey, parallelRouteProp, childNode] = parallelRoute
     parallelRouteProps[parallelRouteKey] = parallelRouteProp
-    if (parallelRouteNodes === undefined) {
-      parallelRouteNodes = new Map()
+    if (childNode !== null) {
+      if (parallelRouteNodes === undefined) {
+        parallelRouteNodes = new Map()
+      }
+      parallelRouteNodes.set(parallelRouteKey, childNode)
     }
-    parallelRouteNodes.set(parallelRouteKey, childNode)
     // Propagate subtree flags from children
-    if (childNode.h !== undefined) {
+    if (childNode?.h !== undefined) {
       prefetchHints = propagateSubtreeBits(prefetchHints, childNode.h)
     }
   }

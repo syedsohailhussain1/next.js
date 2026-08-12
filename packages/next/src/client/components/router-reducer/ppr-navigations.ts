@@ -346,8 +346,32 @@ function updateCacheNodeOnNavigation(
     )
   }
 
-  const newSlots = newRouteTree.slots
   const oldRouterStateChildren = oldRouterState[1]
+  let newSlots = newRouteTree.slots
+
+  // An omitted slot at a segment that still matches the active tree means the
+  // response has no update for that slot. Retain its active route explicitly
+  // in the patched tree. Once a segment changes, we switch to the create path
+  // above, where an omitted slot is absent instead.
+  for (const parallelRouteKey in oldRouterStateChildren) {
+    if (newSlots?.has(parallelRouteKey)) {
+      continue
+    }
+    if (newSlots === null) {
+      newSlots = new Map()
+    } else if (newSlots === newRouteTree.slots) {
+      newSlots = new Map(newSlots)
+    }
+    newSlots.set(
+      parallelRouteKey,
+      reuseActiveSegmentInOmittedSlot(
+        newRouteTree,
+        parallelRouteKey,
+        oldRootRefreshState,
+        oldRouterStateChildren[parallelRouteKey]
+      )
+    )
+  }
 
   let shouldRefreshDynamicData: boolean = false
   switch (freshness) {
@@ -519,7 +543,7 @@ function updateCacheNodeOnNavigation(
         // This is a "default" segment. These are never sent by the server during
         // a soft navigation; instead, the client reuses whatever segment was
         // already active in that slot on the previous route.
-        newRouteTreeChild = reuseActiveSegmentInDefaultSlot(
+        newRouteTreeChild = reuseActiveSegmentInOmittedSlot(
           newRouteTree,
           parallelRouteKey,
           oldRootRefreshState,
@@ -892,17 +916,16 @@ function accumulateRefreshUrl(
   }
 }
 
-function reuseActiveSegmentInDefaultSlot(
+function reuseActiveSegmentInOmittedSlot(
   parentRouteTree: RouteTree<RSCSegmentData | null>,
   parallelRouteKey: string,
   oldRootRefreshState: RefreshState,
   oldRouterState: FlightRouterState
 ): RouteTree<RSCSegmentData | null> {
-  // This is a "default" segment. These are never sent by the server during a
-  // soft navigation; instead, the client reuses whatever segment was already
-  // active in that slot on the previous route. This means if we later need to
-  // refresh the segment, it will have to be refetched from the previous route's
-  // URL. We store it in the Flight Router State.
+  // The server has no update for this slot, so reuse whatever segment was
+  // already active on the previous route. If it later needs to be refreshed,
+  // it must be fetched from the previous route's URL. Store that origin in the
+  // Flight Router State.
 
   let reusedUrl: string
   let reusedRenderedSearch: NormalizedSearch

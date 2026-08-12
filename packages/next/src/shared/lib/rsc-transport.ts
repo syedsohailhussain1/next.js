@@ -129,10 +129,10 @@ export type FullTransportNode = TransportNodeShape & {
  * - `d` omitted: the response makes no claim about this segment's output.
  *   The client keeps what it has, or lazily fetches when it renders (e.g.
  *   segments beneath a loading boundary in a non-PPR prefetch).
- * - A slot key omitted from `c` (or `c` omitted): on a skipped node
- *   (`d.r === null`), the response carries no information about that slot
- *   and the client keeps its subtree untouched. On any other node the
- *   subtree is authoritative, so an omitted slot is simply absent.
+ * - A slot key omitted from `c` (or `c` omitted): if this node's segment
+ *   still matches the active tree, the response carries no information about
+ *   that slot and the client keeps its subtree untouched. If the segment
+ *   changed, the new subtree is authoritative and the omitted slot is absent.
  * - `h` omitted: on a skipped node, the client keeps its existing hints for
  *   the segment; on any other node it means the hints are zero.
  *

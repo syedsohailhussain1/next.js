@@ -1,8 +1,9 @@
-import { LinkAccordion } from './page.client'
+import { LinkAccordion, RetainedCounter } from './page.client'
 
 export default function Page() {
   return (
     <div id="children">
+      <RetainedCounter />
       <section>
         <h2>✅ Should Work WITHOUT default.tsx</h2>
 
@@ -39,13 +40,13 @@ export default function Page() {
       </section>
 
       <section>
-        <h2>🔬 Test Cases - Require Null Default Logic</h2>
+        <h2>🔬 Test Cases - Retain the Active Children Slot</h2>
 
         <div>
           <h3>Test Case 4a: Has @sidebar but NO page.tsx (implicit layout)</h3>
           <LinkAccordion href="/test-nested" />
           <p>Has @sidebar (creates implicit layout) but NO page.tsx.</p>
-          <p>✓ Auto-uses null default (no explicit files needed)</p>
+          <p>✓ Keeps the active children slot during a soft navigation</p>
         </div>
 
         <div>

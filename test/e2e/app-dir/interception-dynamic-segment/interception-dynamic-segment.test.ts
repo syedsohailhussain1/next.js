@@ -160,11 +160,11 @@ describe('interception-dynamic-segment', () => {
   if (!isNextDev) {
     /**
      * Test Case Validation: Ensure NO 404s occur during interception navigation
-     * These tests validate the fix for default.tsx injection with parallel routes.
+     * These tests validate retained slots in partial route responses.
      * Using createRouterAct WITHOUT allowErrorStatusCodes ensures that any 404
      * response will fail the test, preventing the bug where MPA navigation masks 404s.
      */
-    describe('Default.tsx injection validation (no 404s allowed)', () => {
+    describe('retained slot response validation (no 404s allowed)', () => {
       /**
        * Test Case: Dynamic segment interception route [username]/[id]
        * Validates that intercepted routes with dynamic segments don't return 404
@@ -265,23 +265,29 @@ describe('interception-dynamic-segment', () => {
       /**
        * Test Case 4: Has @sidebar but NO page.tsx (THE KEY BUG CASE)
        * Structure: @modal/(.)test-nested/@sidebar/page.tsx (NO page.tsx at root)
-       * Expected: Should work WITHOUT explicit default.tsx (auto null default)
-       * Reason: Interception + parallel routes should inject null default
+       * Expected: Should work WITHOUT explicit default.tsx
+       * Reason: The partial response omits children so the active slot is retained
        *
-       * This is the critical test! Without the fix:
-       * 1. Server returns 404 (default.js calls notFound())
-       * 2. Client sees !res.ok in fetch-server-response.ts:229
-       * 3. Client triggers doMpaNavigation() - full page reload
-       * 4. Navigation still succeeds via MPA, hiding the 404 bug
+       * The response must not encode retention as a __DEFAULT__ route-tree
+       * branch. The existing children subtree, including client state, should
+       * remain mounted after the intercepted slot is updated.
        *
        * With createRouterAct (no allowErrorStatusCodes), 404 fails the test.
        */
-      it('should navigate to /test-nested without 404 (auto null default)', async () => {
+      it('should omit the retained slot and preserve its client state', async () => {
         const { act, browser } = await createBrowserWithRouterAct('/')
 
-        await act(async () => {
-          await navigate(browser, '/test-nested')
-        })
+        await browser.elementById('retained-counter').click()
+        expect(await browser.elementById('retained-counter').text()).toBe(
+          'Retained count: 1'
+        )
+
+        await act(
+          async () => {
+            await navigate(browser, '/test-nested')
+          },
+          { includes: '__DEFAULT__', block: 'reject' }
+        )
 
         await retry(async () => {
           // Modal should show intercepted content
@@ -293,6 +299,9 @@ describe('interception-dynamic-segment', () => {
           // Children slot should still show original page (/)
           const childrenContent = await browser.elementByCss('#children').text()
           expect(childrenContent).toContain('CHILDREN SLOT')
+          expect(await browser.elementById('retained-counter').text()).toBe(
+            'Retained count: 1'
+          )
         })
       })
 
@@ -387,9 +396,11 @@ describe('interception-dynamic-segment', () => {
       })
 
       /**
-       * Cross-interception navigation
+       * An omitted slot only means "retain" while its owning segment matches.
+       * Changing from the test-nested interception tree to the has-both tree
+       * must replace the modal subtree instead of pinning the old one.
        */
-      it('should navigate between different interception routes without 404', async () => {
+      it('should not retain omitted slots after their owning segment changes', async () => {
         const { act, browser } = await createBrowserWithRouterAct('/')
 
         // First interception
@@ -410,6 +421,7 @@ describe('interception-dynamic-segment', () => {
         await retry(async () => {
           const modalContent = await browser.elementByCss('#modal').text()
           expect(modalContent).toContain('TEST CASE 3')
+          expect(modalContent).not.toContain('Intercepted test-nested sidebar')
         })
       })
     })

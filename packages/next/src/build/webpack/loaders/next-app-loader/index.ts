@@ -577,13 +577,8 @@ async function createTreeCodeFromPath(
         let defaultPath = await resolver(`${fullSegmentPath}/default`)
         if (!defaultPath) {
           if (adjacentParallelSegment === 'children') {
-            // When we host applications on Vercel, the status code affects the
-            // underlying behavior of the route, which when we are missing the
-            // children slot of an interception route, will yield a full 404
-            // response for the RSC request instead. For this reason, we expect
-            // that if a default file is missing when we're rendering an
-            // interception route, we instead always render null for the default
-            // slot to avoid the full 404 response.
+            // This branch is omitted from partial responses. It marks a slot
+            // whose active state should be retained during an interception.
             if (isInterceptionRouteAppPath(page)) {
               defaultPath = PARALLEL_ROUTE_DEFAULT_NULL_PATH
             } else {

@@ -1170,13 +1170,6 @@ export interface ExperimentalConfig {
   maxPostponedStateSize?: SizeLimit
 
   /**
-   * Disables compression of the Resume Data Cache (RDC) when persisting
-   * postponed state.
-   * @default false
-   */
-  disableResumeDataCacheCompression?: boolean
-
-  /**
    * enables the minification of server code.
    *
    * Under Turbopack this is overridden by `experimental.turbopackMinify` when
@@ -2293,7 +2286,6 @@ export const defaultConfig = Object.freeze({
     globalNotFound: false,
     browserDebugInfoInTerminal: 'warn',
     lockDistDir: true,
-    disableResumeDataCacheCompression: false,
     proxyClientMaxBodySize: 10_485_760, // 10MB
     hideLogsAfterAbort: false,
     mcpServer: true,
@@ -2405,7 +2397,6 @@ export interface NextConfigRuntime {
     | 'testProxy'
     | 'runtimeServerDeploymentId'
     | 'maxPostponedStateSize'
-    | 'disableResumeDataCacheCompression'
     | 'cachedNavigations'
     | 'exposeTestingApiInProductionBuild'
     | 'instantInsights'
@@ -2473,7 +2464,6 @@ export function getNextConfigRuntime(
     testProxy: ex.testProxy,
     runtimeServerDeploymentId: ex.runtimeServerDeploymentId,
     maxPostponedStateSize: ex.maxPostponedStateSize,
-    disableResumeDataCacheCompression: ex.disableResumeDataCacheCompression,
     cachedNavigations: ex.cachedNavigations,
     exposeTestingApiInProductionBuild: ex.exposeTestingApiInProductionBuild,
     instantInsights: ex.instantInsights,

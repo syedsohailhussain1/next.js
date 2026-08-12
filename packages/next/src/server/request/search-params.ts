@@ -22,7 +22,14 @@ import {
   throwInvariantForMissingStore,
   type RequestStore,
   type ValidationStoreClient,
+  type WorkUnitStore,
 } from '../app-render/work-unit-async-storage.external'
+import {
+  getMetadataSegmentStore,
+  getSegmentStore,
+  getSegmentVaryParamsAccumulator,
+} from '../app-render/segment-store'
+import type { LoaderTree } from '../lib/app-dir-module'
 import { InvariantError } from '../../shared/lib/invariant-error'
 import {
   makeDevtoolsIOAwarePromise,
@@ -96,9 +103,20 @@ export function createSearchParamsFromClient(
 }
 
 // generateMetadata always runs in RSC context so it is equivalent to a Server Page Component
-export function createServerSearchParamsForMetadata(): Promise<SearchParams> {
-  return createServerSearchParamsForServerPage(
-    getMetadataVaryParamsAccumulator()
+function createServerSearchParamsForMetadata(): Promise<SearchParams> {
+  return createServerSearchParams(getMetadataVaryParamsAccumulator())
+}
+
+/**
+ * The `searchParams` promise a server page receives: the shared machinery
+ * below, recording access into the segment's vary-params accumulator.
+ */
+function createServerSearchParamsForServerPage(
+  workUnitStore: WorkUnitStore,
+  segment: LoaderTree
+): Promise<SearchParams> {
+  return createServerSearchParams(
+    getSegmentVaryParamsAccumulator(workUnitStore, segment)
   )
 }
 
@@ -112,7 +130,7 @@ export function createServerSearchParamsForMetadata(): Promise<SearchParams> {
  * postpone / interrupt / error in the scopes where the values are never
  * observable.
  */
-export function createServerSearchParamsForServerPage(
+function createServerSearchParams(
   varyParamsAccumulator: VaryParamsAccumulator | null
 ): Promise<SearchParams> {
   const workStore = workAsyncStorage.getStore()
@@ -158,6 +176,46 @@ export function createServerSearchParamsForServerPage(
     }
   }
   throwInvariantForMissingStore()
+}
+
+/**
+ * The `searchParams` prop for a page segment, created lazily on first access
+ * and memoized on the segment's `SegmentStore` — the same approach as the
+ * segment's vary-params accumulator, whose access it records into. Everything
+ * that hands a page its search params goes through this accessor, so every
+ * consumer observes the *same* promise for a given (work unit, segment); this
+ * matters because React's `use()` protocol writes `status`/`value` onto the
+ * thenable and re-reads them across suspends.
+ *
+ */
+export function getServerSearchParamsForServerPage(
+  workUnitStore: WorkUnitStore,
+  segment: LoaderTree
+): Promise<SearchParams> {
+  const segmentStore = getSegmentStore(workUnitStore, segment)
+  return (segmentStore.searchParams ??= createServerSearchParamsForServerPage(
+    workUnitStore,
+    segment
+  ))
+}
+
+/**
+ * The `searchParams` promise that `generateMetadata` (and viewport) receives,
+ * created lazily on first access and memoized on the metadata segment's store
+ * (see `getMetadataSegmentStore`) — the same pattern as a page segment's,
+ * because the metadata segment behaves like a segment in every way except
+ * being page-wide. Reads the ambient work unit store because metadata's
+ * consumers don't hold one.
+ */
+export function getServerSearchParamsForMetadata(): Promise<SearchParams> {
+  const workUnitStore = workUnitAsyncStorage.getStore()
+  if (!workUnitStore) {
+    // Fall through to the machinery, which throws the missing-store
+    // invariant.
+    return createServerSearchParamsForMetadata()
+  }
+  const segmentStore = getMetadataSegmentStore(workUnitStore)
+  return (segmentStore.searchParams ??= createServerSearchParamsForMetadata())
 }
 
 export function createPrerenderSearchParamsForClientPage(): Promise<SearchParams> {

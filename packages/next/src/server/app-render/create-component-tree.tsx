@@ -172,7 +172,7 @@ async function createComponentTreeInternal(
       RenderFromTemplateContext,
       ClientPageRoot,
       ClientSegmentRoot,
-      createServerSearchParamsForServerPage,
+      getServerSearchParamsForServerPage,
       createPrerenderSearchParamsForClientPage,
       createServerParamsForServerSegment,
       createPrerenderParamsForClientSegment,
@@ -870,12 +870,13 @@ async function createComponentTreeInternal(
         varyParamsAccumulator
       )
 
-      // If we are passing searchParams to a server component Page we need to
-      // track their usage in case the current render mode tracks dynamic API
-      // usage. The raw values are read from the ambient work unit store; the
-      // segment contributes only its vary-params accumulator.
-      const searchParams = createServerSearchParamsForServerPage(
-        varyParamsAccumulator
+      // The segment's `searchParams` prop, created lazily and memoized on the
+      // segment store (recording access into this segment's vary-params
+      // accumulator). Everything that hands a page its search params goes
+      // through this accessor.
+      const searchParams = getServerSearchParamsForServerPage(
+        workUnitStore,
+        tree
       )
 
       if (isUseCacheFunction(PageComponent)) {

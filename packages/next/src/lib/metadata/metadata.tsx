@@ -13,7 +13,7 @@ import type {
 } from './types/metadata-interface'
 import { isHTTPAccessFallbackError } from '../../client/components/http-access-fallback/http-access-fallback'
 import type { MetadataContext } from './types/resolvers'
-import { createServerSearchParamsForMetadata } from '../../server/request/search-params'
+import { getServerSearchParamsForMetadata } from '../../server/request/search-params'
 import { createServerPathnameForMetadata } from '../../server/request/pathname'
 
 import {
@@ -51,8 +51,9 @@ export function createMetadataComponents({
   MetadataOutlet: React.ComponentType
 } {
   // Search params are read from the ambient work unit store (the request's
-  // parsed query), so there's nothing to thread in here.
-  const searchParams = createServerSearchParamsForMetadata()
+  // parsed query) and memoized on the metadata segment's store, so there's
+  // nothing to thread in here.
+  const searchParams = getServerSearchParamsForMetadata()
   const pathnameForMetadata = createServerPathnameForMetadata(pathname)
 
   async function Viewport() {

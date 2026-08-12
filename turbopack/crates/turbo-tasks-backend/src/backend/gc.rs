@@ -12,7 +12,7 @@
 
 use std::{ops::ControlFlow, sync::atomic::Ordering};
 
-use turbo_tasks::{TaskId, TurboTasks, scope::scope_unbounded_with};
+use turbo_tasks::{TaskId, TurboTasks, scope_unbounded::scope_unbounded_with};
 
 use crate::backend::{
     TurboTasksBackend,

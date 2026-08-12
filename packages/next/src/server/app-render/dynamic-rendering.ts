@@ -815,8 +815,10 @@ export enum DynamicHoleKind {
   Link = 1,
   /** We know that this hole is caused by runtime data. */
   Runtime = 2,
+  /** We know that this hole is caused by navigation(). */
+  Navigation = 3,
   /** We know that this hole is caused by dynamic data. */
-  Dynamic = 3,
+  Dynamic = 4,
 }
 
 /** Stores dynamic reasons used during an SSR render in instant validation. */
@@ -879,7 +881,9 @@ export function trackDynamicHoleInNavigation(
         ? createLinkMetadataError(workStore.route)
         : kind === DynamicHoleKind.Runtime
           ? createRuntimeMetadataError(workStore.route)
-          : createDynamicMetadataError(workStore.route),
+          : kind === DynamicHoleKind.Navigation
+            ? createNavigationMetadataError(workStore.route)
+            : createDynamicMetadataError(workStore.route),
       componentStack,
       effectiveCreateInstantStack
     )
@@ -892,7 +896,9 @@ export function trackDynamicHoleInNavigation(
         ? createLinkViewportError(workStore.route)
         : kind === DynamicHoleKind.Runtime
           ? createRuntimeViewportError(workStore.route)
-          : createDynamicViewportError(workStore.route),
+          : kind === DynamicHoleKind.Navigation
+            ? createNavigationViewportError(workStore.route)
+            : createDynamicViewportError(workStore.route),
       componentStack,
       effectiveCreateInstantStack
     )
@@ -988,7 +994,9 @@ export function trackDynamicHoleInNavigation(
       ? createLinkBodyErrorInNavigation(workStore.route)
       : kind === DynamicHoleKind.Runtime
         ? createRuntimeBodyErrorInNavigation(workStore.route)
-        : createDynamicBodyErrorInNavigation(workStore.route),
+        : kind === DynamicHoleKind.Navigation
+          ? createNavigationBodyErrorInNavigation(workStore.route)
+          : createDynamicBodyErrorInNavigation(workStore.route),
     componentStack,
     effectiveCreateInstantStack
   )
